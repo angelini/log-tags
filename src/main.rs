@@ -7,8 +7,15 @@ use regex::Regex;
 
 #[derive(Debug)]
 enum Error {
+    Lua(rlua::Error),
     Io(std::io::Error),
     Regex(regex::Error),
+}
+
+impl From<rlua::Error> for Error {
+    fn from(err: rlua::Error) -> Error {
+        Error::Lua(err)
+    }
 }
 
 impl From<std::io::Error> for Error {
@@ -23,12 +30,29 @@ impl From<regex::Error> for Error {
     }
 }
 
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
+            Error::Lua(ref err) => write!(f, "{}", err),
             Error::Io(ref err) => write!(f, "{}", err),
             Error::Regex(ref err) => write!(f, "{}", err),
+        }
+    }
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Default)]
+struct LuaScript {
+    setup: Option<String>,
+    eval: Option<String>,
+}
+
+impl LuaScript {
+    fn new<S: Into<String>>(setup: Option<S>, eval: Option<S>) -> LuaScript {
+        LuaScript {
+            setup: setup.map(|s| s.into()),
+            eval: eval.map(|s| s.into()),
         }
     }
 }
@@ -36,71 +60,94 @@ impl fmt::Display for Error {
 struct TagDefinition {
     r: Regex,
     name: String,
-    transform: Option<String>,
+    transform: LuaScript,
 }
 
 impl TagDefinition {
-    fn new<S: Into<String>>(
-        name: S,
-        pattern: &str,
-        transform: Option<S>,
-    ) -> Result<TagDefinition, Error> {
+    fn new<S: Into<String>>(name: S, pattern: &str, transform: LuaScript) -> Result<TagDefinition> {
         Ok(TagDefinition {
             r: Regex::new(&pattern)?,
             name: name.into(),
-            transform: transform.map(|t| t.into()),
+            transform: transform,
         })
     }
 }
 
-fn transform_chunk(lua: &rlua::Lua, transform: &str, chunk: &str) -> rlua::Result<String> {
-    lua.context(|lua_ctx| {
-        lua_ctx.globals().set("chunk", chunk)?;
-        lua_ctx.load(transform).eval()
-    })
+fn transform_chunk(lua: &rlua::Lua, transform: &LuaScript, chunk: &str) -> Result<String> {
+    match transform.eval {
+        Some(ref eval_src) => {
+            Ok(lua.context(|lua_ctx| {
+                lua_ctx.globals().set("chunk", chunk)?;
+                lua_ctx.load(eval_src).eval()
+            })?)
+        }
+        None => Ok(chunk.to_string()),
+    }
+
 }
 
 fn line_tags(lua: &rlua::Lua, line: &str, definitions: &[TagDefinition]) -> Vec<Option<String>> {
     definitions
         .iter()
-        .map(|definition| if let Some(captures) = definition
-            .r
-            .captures(line)
-        {
-            captures.get(1).map_or(
-                None,
-                |m| match &definition.transform {
-                    Some(transform) => {
-                        match transform_chunk(lua, &transform, m.as_str()) {
-                            Ok(value) => Some(value),
-                            Err(_) => None,
-                        }
-                    }
-                    None => Some(m.as_str().to_string()),
-                },
-            )
-        } else {
-            None
+        .map(|definition| {
+            definition.r.captures(line).and_then(|captures| {
+                captures.get(1).map_or(None, |m| {
+                    transform_chunk(lua, &definition.transform, m.as_str()).ok()
+                })
+            })
         })
         .collect()
 }
 
-fn main() -> Result<(), Error> {
-    let tag_defs = vec![
-        TagDefinition::new("date", r#"\[(\S+ \S+ \d+ \d+:\d+:\d+ \d+)\]"#, None)?,
-        TagDefinition::new(
-            "parsed-date",
-            r#"\[(\S+ \S+ \d+ \d+:\d+:\d+ \d+)\]"#,
-            Some(
-                r#"
-string.sub(chunk, 9, 10) .. "-" .. string.sub(chunk, 5, 7) .. "-" .. string.sub(chunk, 21, 24)
+fn run_setups(lua: &rlua::Lua, definitions: &[TagDefinition]) -> Result<()> {
+    Ok(lua.context(|lua_ctx| {
+        definitions
+            .iter()
+            .map(|definition| {
+                if let Some(ref setup) = definition.transform.setup {
+                    lua_ctx.load(setup).eval()?;
+                }
+                Ok(())
+            })
+            .collect::<rlua::Result<()>>()
+    })?)
+}
+
+fn main() -> Result<()> {
+    let tag_defs =
+        vec![
+            TagDefinition::new(
+                "date",
+                r#"\[(\S+ \S+ \d+ \d+:\d+:\d+ \d+)\]"#,
+                LuaScript::default()
+            )?,
+            TagDefinition::new(
+                "parsed-date",
+                r#"\[(\S+ \S+ \d+ \d+:\d+:\d+ \d+)\]"#,
+                LuaScript::new(
+                    Some(
+                        r#"
+months = {}
+months["Dec"] = 12
+
+function parse_month (m)
+  return months[m]
+end
 "#,
-            )
-        )?,
-        TagDefinition::new("error-level", r#"\[(error|notice)\]"#, None)?,
-    ];
+                    ),
+                    Some(
+                        r#"
+string.sub(chunk, 9, 10) .. "-" .. parse_month(string.sub(chunk, 5, 7)) .. "-" .. string.sub(chunk, 21, 24)
+"#,
+                    ),
+                )
+            )?,
+            TagDefinition::new("error-level", r#"\[(error|notice)\]"#, LuaScript::default())?,
+        ];
 
     let lua = rlua::Lua::new();
+
+    run_setups(&lua, &tag_defs)?;
 
     let file = fs::File::open("apache.log")?;
     let reader = io::BufReader::new(file);
