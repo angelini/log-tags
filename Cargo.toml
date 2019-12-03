@@ -7,3 +7,4 @@ edition = "2018"
 [dependencies]
 regex = "1"
 rlua = "0.17"
+rustyline = "5.0"
