@@ -1,11 +1,11 @@
-> log = load("apache.log")
+> load('log, "apache.log")
 
 path = ~/src/log-tags/apache.log
 mtime = Nov 22 21:33
 
-> tag(log, 'level, r"\[(error|notice)\]")
+> tag('log, 'level, r"\[(error|notice)\]")
 
-> take(log, 2)
+> take('log, 2)
 
 0: [Sun Dec 04 04:47:44 2005] [notice] workerEnv.init() ok /etc/httpd/conf/workers2.properties
    => level: notice
@@ -67,3 +67,38 @@ notice:
   0: [Sun Dec 04 04:47:44 2005] [notice] workerEnv.init() ok /etc/httpd/conf/workers2.properties
      => level: notice
         date:  04-12-2005
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+> load('log, "example.txt")
+
+> count('log)
+> count_distinct('log, 'level)
+
+> tag('log, 'date)
+| regex(r"\[(\S+ \S+ \d+ \d+:\d+:\d+ \d+)\]")
+
+> tag('log, 'level)
+| regex(r"\[(error|notice)\]")
+
+> distinct('log, 'level)
+> count(distinct('log, 'level))
+
+> 'log
+| tail(10)
+| distinct('level)
+| count
+| keep('distinct_levels)
+
+> tag('log, 'date)
+| regex(r"\[(\S+ \S+ \d+ \d+:\d+:\d+ \d+)\]")
+| setup("""
+months = {}
+months["Dec"] = 12
+
+function parse_date (d)
+  return string.sub(chunk, 9, 10) .. "-" .. months[string.sub(chunk, 5, 7)] .. "-" .. string.sub(chunk, 21, 24)
+end
+""")
+| transform("parse_date(data)")

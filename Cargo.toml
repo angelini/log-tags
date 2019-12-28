@@ -5,7 +5,10 @@ authors = ["Alex Angelini <alex.louis.angelini@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-peg = "0.6"
 regex = "1"
 rlua = "0.17"
 rustyline = "5.0"
+
+[dependencies.nom]
+version = "5.0"
+features = ["regexp"]

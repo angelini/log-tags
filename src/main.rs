@@ -2,6 +2,7 @@ use std::path;
 
 mod error;
 mod engine;
+mod parser;
 mod repl;
 
 use error::Result;
@@ -49,10 +50,15 @@ string.sub(chunk, 9, 10) .. "-" .. parse_month(string.sub(chunk, 5, 7)) .. "-" .
 
     for command in commands {
         println!("running: {:?}", command);
-        for result in engine.run_command(&command)? {
-            println!("  {}", result);
+        let (_, output) = engine.run_command(&command)?;
+        for line in output {
+            println!("  {}", line);
         }
     }
 
-    repl::start()
+    match repl::start(&mut engine) {
+        Ok(_) => println!("done"),
+        Err(e) => println!("{}", e),
+    };
+    Ok(())
 }

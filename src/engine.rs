@@ -14,6 +14,12 @@ pub struct FileId(pub usize);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TagId(pub usize);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Id {
+    File(FileId),
+    Tag(TagId)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LuaScript {
     setup: Option<String>,
@@ -154,11 +160,11 @@ impl Engine {
         }
     }
 
-    pub fn run_command(&mut self, command: &Command) -> Result<Vec<String>> {
+    pub fn run_command(&mut self, command: &Command) -> Result<(Option<Id>, Vec<String>)> {
         match command {
             Command::Load(path) => self
                 .load_file(path)
-                .map(|_| vec![format!("loaded {:?}", path)]),
+                .map(|id| (Some(id), vec![format!("loaded {:?}", path)])),
             Command::Tag(file_id, tag_name, regex_str, script) => {
                 self.run_setup(script)?;
 
@@ -172,7 +178,7 @@ impl Engine {
                     tag_id,
                     TagDefinition::new(tag_name, regex_str, script.clone())?,
                 );
-                Ok(vec!["".to_string()])
+                Ok((Some(Id::Tag(tag_id)), vec!["".to_string()]))
             }
             Command::Take(file_id, count) => {
                 self.ensure_lines(*file_id, 0, *count)?;
@@ -192,7 +198,7 @@ impl Engine {
                         ))
                     }
                 }
-                Ok(output)
+                Ok((None, output))
             }
         }
     }
@@ -240,11 +246,11 @@ impl Engine {
         })
     }
 
-    fn load_file(&mut self, path: &path::Path) -> Result<()> {
+    fn load_file(&mut self, path: &path::Path) -> Result<Id> {
         let full_path = path.canonicalize()?;
         let id = self.get_or_create_file_id(&full_path.to_string_lossy());
         self.files.insert(id, fs::File::open(path)?);
-        Ok(())
+        Ok(Id::File(id))
     }
 
     fn ensure_lines(&mut self, file_id: FileId, start: usize, end: usize) -> Result<()> {
