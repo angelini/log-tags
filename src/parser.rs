@@ -1,7 +1,8 @@
 use nom::{
     branch::alt,
-    bytes::complete::{escaped, tag, take_while1},
-    character::complete::{alpha1, alphanumeric1, char, digit1, multispace0, multispace1, one_of},
+    bytes::complete::tag,
+    bytes::streaming::take_until,
+    character::complete::{alpha1, char, digit1, multispace0},
     combinator::{cut, map},
     error::VerboseError,
     multi::separated_list,
@@ -29,16 +30,8 @@ fn parse_symbol<'a>(i: &'a str) -> IResult<&'a str, String, Err<'a>> {
     })(i)
 }
 
-fn parse_str<'a>(i: &'a str) -> IResult<&'a str, &'a str, Err<'a>> {
-    escaped(
-        alt((
-            alphanumeric1,
-            multispace1,
-            take_while1(|x| "!@#$%^&*()[]{}|;':,./<>?".contains(x)),
-        )),
-        '\\',
-        one_of("\"n\\"),
-    )(i)
+fn parse_str<'a>(i: &'a str) -> IResult<&'a str, &str, Err<'a>> {
+    take_until("\"")(i)
 }
 
 fn parse_double_quoted_str<'a>(i: &'a str) -> IResult<&'a str, String, Err<'a>> {

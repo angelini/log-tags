@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use nom::error::{convert_error, VerboseError};
+use nom::error::convert_error;
 use rustyline::error::ReadlineError;
 
 use crate::engine::{Command, Engine, Id, Output};
@@ -72,6 +72,21 @@ impl Application {
             Err(SyntaxError::ExpectedApplication)
         }
     }
+
+    fn is_pipelined(&self) -> bool {
+        match self {
+            Application::Load(_, _) => false,
+            Application::Regex(_, _) => false,
+            Application::Tag(_, _) => false,
+            Application::Take(_, _) => false,
+            Application::Transform(_, _, _) => false,
+
+            Application::RegexPipe(_) => true,
+            Application::TagPipe(_) => true,
+            Application::TakePipe(_) => true,
+            Application::TransformPipe(_, _) => true,
+        }
+    }
 }
 
 struct Repl {
@@ -113,12 +128,8 @@ impl Repl {
             }
             Application::Tag(file_name, tag_name) => {
                 if let Some(Id::File(file_id)) = self.symbols.get(&file_name) {
-                    let output =
-                        engine.run_command(&Command::Tag(*file_id, tag_name.clone()))?;
-                    *self
-                        .symbols
-                        .entry(tag_name)
-                        .or_insert(output.id) = output.id;
+                    let output = engine.run_command(&Command::Tag(*file_id, tag_name.clone()))?;
+                    *self.symbols.entry(tag_name).or_insert(output.id) = output.id;
                     Ok(output)
                 } else {
                     Err(Error::FileNotLoaded(file_name))
@@ -169,25 +180,34 @@ impl Repl {
     }
 }
 
-fn parse_line(line: String) -> Result<Option<Application>> {
-    if line == "" {
-        return Ok(None);
+enum ParseState {
+    Empty,
+    Incomplete,
+    Root(Application),
+    Pipelined(Application),
+}
+
+fn parse_line(line: &str, is_continuation: bool) -> Result<ParseState> {
+    if !is_continuation && line == "" {
+        return Ok(ParseState::Empty);
     }
 
-    parser::parse_expression(&line)
-        .map_err(|e: nom::Err<VerboseError<&str>>| match e {
+    match parser::parse_expression(&line) {
+        Ok((_, exp)) => match Application::from_expression(&exp) {
+            Ok(func) if func.is_pipelined() => Ok(ParseState::Pipelined(func)),
+            Ok(func) => Ok(ParseState::Root(func)),
+            Err(err) => Err(Error::Syntax(err, line.to_string())),
+        },
+        Err(err) => match err {
             nom::Err::Error(e) | nom::Err::Failure(e) => {
                 // FIXME: https://github.com/Geal/nom/issues/1027
                 let default = format!("{:#?}", e);
                 let converted = std::panic::catch_unwind(|| convert_error(&line, e));
-                Error::Parser(converted.unwrap_or(default))
+                Err(Error::Parser(converted.unwrap_or(default)))
             }
-            _ => panic!("Incomplete error"),
-        })
-        .and_then(|(_, exp)| match Application::from_expression(&exp) {
-            Ok(func) => Ok(Some(func)),
-            Err(err) => Err(Error::Syntax(err, line.clone())),
-        })
+            nom::Err::Incomplete(_) => Ok(ParseState::Incomplete),
+        },
+    }
 }
 
 pub fn start(mut engine: &mut Engine) -> Result<()> {
@@ -197,34 +217,58 @@ pub fn start(mut engine: &mut Engine) -> Result<()> {
     }
 
     let mut repl = Repl::new();
-    let mut buffer: Vec<Application> = vec![];
+    let mut line = String::new();
+    let mut applications: Vec<Application> = vec![];
 
     loop {
-        let readline = if buffer.is_empty() {
+        let readline = if applications.is_empty() {
             rl.readline("> ")
         } else {
-            rl.readline("| ")
+            if line.len() == 0 {
+                rl.readline("| ")
+            } else {
+                rl.readline("")
+            }
         };
 
         match readline {
-            Ok(line) => {
-                rl.add_history_entry(line.as_str());
+            Ok(segment) => {
+                let is_continuation = !line.is_empty();
+                line.push_str(&segment);
 
-                match parse_line(line)? {
-                    Some(func) => buffer.push(func),
-                    None => {
+                match parse_line(&line, is_continuation)? {
+                    ParseState::Incomplete => {
+                        line.push_str("\n");
+                    }
+                    ParseState::Root(app) => {
+                        if !applications.is_empty() {
+                            return Err(Error::ApplicationOrder);
+                        }
+                        applications.push(app);
+                        rl.add_history_entry(line);
+                        line = String::new();
+                    }
+                    ParseState::Pipelined(app) => {
+                        if applications.is_empty() {
+                            return Err(Error::ApplicationOrder);
+                        }
+                        println!("app: {:?}", app);
+                        applications.push(app);
+                        rl.add_history_entry(line);
+                        line = String::new();
+                    }
+                    ParseState::Empty => {
                         let mut target = None;
-                        for func in buffer {
-                            println!("Executing: {:?}", func);
-                            let output = repl.execute(&mut engine, func, target)?;
+                        for app in applications {
+                            let output = repl.execute(&mut engine, app, target)?;
                             target = Some(output.id);
 
-                            println!("Output:");
                             for line in output.lines {
                                 println!("  {}", line);
                             }
+                            println!();
                         }
-                        buffer = vec![];
+                        applications = vec![];
                     }
                 }
             }
@@ -242,6 +286,7 @@ pub fn start(mut engine: &mut Engine) -> Result<()> {
             }
         }
     }
+
     rl.save_history("history.txt").unwrap();
     Ok(())
 }
