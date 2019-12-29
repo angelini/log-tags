@@ -34,7 +34,7 @@ fn parse_str<'a>(i: &'a str) -> IResult<&'a str, &'a str, Err<'a>> {
         alt((
             alphanumeric1,
             multispace1,
-            take_while1(|x| "!@#$%^&*()[]{};':,./<>?".contains(x)),
+            take_while1(|x| "!@#$%^&*()[]{}|;':,./<>?".contains(x)),
         )),
         '\\',
         one_of("\"n\\"),

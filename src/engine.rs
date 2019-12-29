@@ -17,7 +17,7 @@ pub struct TagId(pub usize);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Id {
     File(FileId),
-    Tag(TagId)
+    Tag(TagId),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -27,10 +27,10 @@ pub struct LuaScript {
 }
 
 impl LuaScript {
-    pub fn new<S: Into<String>>(setup: Option<S>, eval: Option<S>) -> LuaScript {
+    pub fn new<S: Into<String>>(eval: S, setup: Option<S>) -> LuaScript {
         LuaScript {
             setup: setup.map(|s| s.into()),
-            eval: eval.map(|s| s.into()),
+            eval: Some(eval.into()),
         }
     }
 }
@@ -42,12 +42,21 @@ struct TagDefinition {
 }
 
 impl TagDefinition {
-    fn new<S: Into<String>>(name: S, pattern: &str, transform: LuaScript) -> Result<TagDefinition> {
+    fn new<S: Into<String>>(name: S) -> Result<TagDefinition> {
         Ok(TagDefinition {
-            regex: Regex::new(&pattern)?,
+            regex: Regex::new("")?,
             name: name.into(),
-            transform: transform,
+            transform: LuaScript::default(),
         })
+    }
+
+    fn with_regex(&mut self, regex: &str) -> Result<()> {
+        self.regex = Regex::new(regex)?;
+        Ok(())
+    }
+
+    fn with_script(&mut self, script: LuaScript) {
+        self.transform = script;
     }
 }
 
@@ -57,7 +66,7 @@ struct TagDefinitions {
     order: Vec<TagId>,
 }
 
-impl TagDefinitions {
+impl<'a> TagDefinitions {
     fn get(&self, id: &TagId) -> Option<&TagDefinition> {
         self.definitions.get(id)
     }
@@ -65,6 +74,10 @@ impl TagDefinitions {
     fn insert(&mut self, id: TagId, definition: TagDefinition) -> Option<TagDefinition> {
         self.order.push(id);
         self.definitions.insert(id, definition)
+    }
+
+    fn get_mut(&mut self, id: &TagId) -> Option<&mut TagDefinition> {
+        self.definitions.get_mut(id)
     }
 
     fn iter(&self) -> TagDefinitionsIterator {
@@ -117,7 +130,9 @@ impl Tags {
 #[derive(Debug)]
 pub enum Command {
     Load(path::PathBuf),
-    Tag(FileId, String, String, LuaScript),
+    Tag(FileId, String),
+    Regex(TagId, String),
+    Transform(TagId, String, Option<String>),
     Take(FileId, usize),
 }
 
@@ -130,6 +145,20 @@ struct LineCache {
 impl LineCache {
     fn end(&self) -> usize {
         self.start + self.loaded.len()
+    }
+}
+
+pub struct Output {
+    pub id: Id,
+    pub lines: Vec<String>,
+}
+
+impl Output {
+    fn new(id: Id, lines: Vec<String>) -> Output {
+        Output {
+            id: id,
+            lines: lines,
+        }
     }
 }
 
@@ -160,25 +189,39 @@ impl Engine {
         }
     }
 
-    pub fn run_command(&mut self, command: &Command) -> Result<(Option<Id>, Vec<String>)> {
+    pub fn run_command(&mut self, command: &Command) -> Result<Output> {
         match command {
             Command::Load(path) => self
                 .load_file(path)
-                .map(|id| (Some(id), vec![format!("loaded {:?}", path)])),
-            Command::Tag(file_id, tag_name, regex_str, script) => {
-                self.run_setup(script)?;
-
+                .map(|id| Output::new(id, vec![format!("loaded {:?}", path)])),
+            Command::Tag(file_id, tag_name) => {
                 let tag_id = self.get_or_create_tag_id(tag_name);
+
                 let definitions = self
                     .definitions
                     .entry(*file_id)
                     .or_insert(TagDefinitions::default());
+                definitions.insert(tag_id, TagDefinition::new(tag_name)?);
 
-                definitions.insert(
-                    tag_id,
-                    TagDefinition::new(tag_name, regex_str, script.clone())?,
-                );
-                Ok((Some(Id::Tag(tag_id)), vec!["".to_string()]))
+                Ok(Output::new(Id::Tag(tag_id), vec!["".to_string()]))
+            }
+            Command::Regex(tag_id, regex) => {
+                let definition = self
+                    .get_mut_definition_by_tag(tag_id)
+                    .ok_or_else(|| Error::MissingId(format!("{:?}", tag_id)))?;
+                definition.with_regex(regex)?;
+                Ok(Output::new(Id::Tag(*tag_id), vec![]))
+            }
+            Command::Transform(tag_id, transform, setup) => {
+                let script = LuaScript::new(transform, setup.as_ref());
+                self.run_setup(&script)?;
+
+                let definition = self
+                    .get_mut_definition_by_tag(tag_id)
+                    .ok_or_else(|| Error::MissingId(format!("{:?}", tag_id)))?;
+                definition.with_script(script);
+
+                Ok(Output::new(Id::Tag(*tag_id), vec![]))
             }
             Command::Take(file_id, count) => {
                 self.ensure_lines(*file_id, 0, *count)?;
@@ -198,7 +241,7 @@ impl Engine {
                         ))
                     }
                 }
-                Ok((None, output))
+                Ok(Output::new(Id::File(*file_id), output))
             }
         }
     }
@@ -427,5 +470,15 @@ impl Engine {
             })?),
             None => Ok(chunk.to_string()),
         }
+    }
+
+    fn get_mut_definition_by_tag(&mut self, id: &TagId) -> Option<&mut TagDefinition> {
+        for definitions in self.definitions.values_mut() {
+            let definition = definitions.get_mut(id);
+            if definition.is_some() {
+                return definition;
+            }
+        }
+        None
     }
 }
