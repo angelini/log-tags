@@ -36,22 +36,22 @@ impl LuaScript {
 }
 
 struct TagDefinition {
-    regex: Regex,
     name: String,
+    regex: Option<Regex>,
     transform: LuaScript,
 }
 
 impl TagDefinition {
-    fn new<S: Into<String>>(name: S) -> Result<TagDefinition> {
-        Ok(TagDefinition {
-            regex: Regex::new("")?,
+    fn new<S: Into<String>>(name: S) -> TagDefinition {
+        TagDefinition {
+            regex: None,
             name: name.into(),
             transform: LuaScript::default(),
-        })
+        }
     }
 
     fn with_regex(&mut self, regex: &str) -> Result<()> {
-        self.regex = Regex::new(regex)?;
+        self.regex = Some(Regex::new(regex)?);
         Ok(())
     }
 
@@ -164,14 +164,10 @@ impl Output {
 
 pub struct Engine {
     last_id: usize,
-    file_ids: HashMap<String, FileId>,
-    tag_ids: HashMap<String, TagId>,
-
     files: HashMap<FileId, fs::File>,
     lines: HashMap<FileId, LineCache>,
     definitions: HashMap<FileId, TagDefinitions>,
     tags: HashMap<FileId, HashMap<TagId, Tags>>,
-
     lua: rlua::Lua,
 }
 
@@ -179,8 +175,6 @@ impl Engine {
     pub fn new() -> Engine {
         Engine {
             last_id: 0,
-            file_ids: HashMap::new(),
-            tag_ids: HashMap::new(),
             files: HashMap::new(),
             lines: HashMap::new(),
             definitions: HashMap::new(),
@@ -191,17 +185,19 @@ impl Engine {
 
     pub fn run_command(&mut self, command: &Command) -> Result<Output> {
         match command {
-            Command::Load(path) => self
-                .load_file(path)
-                .map(|id| Output::new(id, vec![format!("loaded {:?}", path)])),
+            Command::Load(path) => {
+                let id = self.next_file_id();
+                self.files.insert(id, fs::File::open(path)?);
+                Ok(Output::new(Id::File(id), vec![format!("loaded {:?}", path)]))
+            }
             Command::Tag(file_id, tag_name) => {
-                let tag_id = self.get_or_create_tag_id(tag_name);
+                let tag_id = self.next_tag_id();
 
                 let definitions = self
                     .definitions
                     .entry(*file_id)
                     .or_insert(TagDefinitions::default());
-                definitions.insert(tag_id, TagDefinition::new(tag_name)?);
+                definitions.insert(tag_id, TagDefinition::new(tag_name));
 
                 Ok(Output::new(Id::Tag(tag_id), vec!["".to_string()]))
             }
@@ -246,38 +242,14 @@ impl Engine {
         }
     }
 
-    fn get_or_create_file_id(&mut self, key: &str) -> FileId {
-        if !self.file_ids.contains_key(key) {
-            self.last_id += 1;
-            self.file_ids.insert(key.to_string(), FileId(self.last_id));
-        }
-
-        *self.file_ids.get(key).unwrap()
+    fn next_file_id(&mut self) -> FileId {
+        self.last_id += 1;
+        FileId(self.last_id)
     }
 
-    fn get_or_create_tag_id(&mut self, key: &str) -> TagId {
-        if !self.tag_ids.contains_key(key) {
-            self.last_id += 1;
-            self.tag_ids.insert(key.to_string(), TagId(self.last_id));
-        }
-
-        *self.tag_ids.get(key).unwrap()
-    }
-
-    fn debug_fid(&self, id: FileId) -> String {
-        self.file_ids
-            .iter()
-            .find(|(_, &val)| val == id)
-            .map(|(k, _)| format!("file:{}", k))
-            .unwrap_or_else(|| "FILE_ID_NOT_FOUND".to_string())
-    }
-
-    fn debug_tid(&self, id: TagId) -> String {
-        self.tag_ids
-            .iter()
-            .find(|(_, &val)| val == id)
-            .map(|(k, _)| format!("tag:{}", k))
-            .unwrap_or_else(|| "TAG_ID_NOT_FOUND".to_string())
+    fn next_tag_id(&mut self) -> TagId {
+        self.last_id += 1;
+        TagId(self.last_id)
     }
 
     fn run_setup(&mut self, script: &LuaScript) -> Result<()> {
@@ -289,19 +261,12 @@ impl Engine {
         })
     }
 
-    fn load_file(&mut self, path: &path::Path) -> Result<Id> {
-        let full_path = path.canonicalize()?;
-        let id = self.get_or_create_file_id(&full_path.to_string_lossy());
-        self.files.insert(id, fs::File::open(path)?);
-        Ok(Id::File(id))
-    }
-
     fn ensure_lines(&mut self, file_id: FileId, start: usize, end: usize) -> Result<()> {
         let cache = self.lines.entry(file_id).or_insert(LineCache::default());
         if cache.start > start || cache.end() < end {
             match self.files.get(&file_id) {
                 Some(file) => Engine::cache_lines_from_disk(cache, file, start, end),
-                None => Err(Error::FileNotLoaded(self.debug_fid(file_id))),
+                None => Err(Error::FileNotLoaded(format!("{:?}", file_id))),
             }
         } else {
             Ok(())
@@ -334,9 +299,9 @@ impl Engine {
         let definition = self
             .definitions
             .get(&file_id)
-            .ok_or_else(|| Error::MissingId(self.debug_fid(file_id)))?
+            .ok_or_else(|| Error::MissingId(format!("{:?}", file_id)))?
             .get(&tag_id)
-            .ok_or_else(|| Error::MissingId(self.debug_tid(tag_id)))?;
+            .ok_or_else(|| Error::MissingId(format!("{:?}", tag_id)))?;
 
         let mut prefix = None;
         let mut suffix = None;
@@ -426,11 +391,15 @@ impl Engine {
         lines
             .iter()
             .map(|line| {
-                definition.regex.captures(line).and_then(|captures| {
-                    captures.get(1).map_or(None, |m| {
-                        Engine::transform_chunk(&lua, &definition.transform, m.as_str()).ok()
+                if let Some(ref regex) = definition.regex {
+                    regex.captures(line).and_then(|captures| {
+                        captures.get(1).map_or(None, |m| {
+                            Engine::transform_chunk(&lua, &definition.transform, m.as_str()).ok()
+                        })
                     })
-                })
+                } else {
+                    Engine::transform_chunk(&lua, &definition.transform, line).ok()
+                }
             })
             .collect()
     }
