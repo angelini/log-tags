@@ -100,13 +100,13 @@ impl Repl {
         }
     }
 
-    fn execute(
+    fn invoke(
         &mut self,
         engine: &mut Engine,
-        func: Application,
+        app: Application,
         target: Option<Id>,
     ) -> Result<Output> {
-        match func {
+        match app {
             Application::Load(name, path_str) => {
                 let output = engine.run_command(&Command::Load(PathBuf::from(path_str)))?;
                 *self.symbols.entry(name.to_string()).or_insert(output.id) = output.id;
@@ -260,7 +260,7 @@ pub fn start(mut engine: &mut Engine) -> Result<()> {
                     ParseState::Empty => {
                         let mut target = None;
                         for app in applications {
-                            let output = repl.execute(&mut engine, app, target)?;
+                            let output = repl.invoke(&mut engine, app, target)?;
                             target = Some(output.id);
 
                             for line in output.lines {

@@ -5,6 +5,7 @@ authors = ["Alex Angelini <alex.louis.angelini@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+bit-set = "0.5"
 regex = "1"
 rlua = "0.17"
 rustyline = "5.0"

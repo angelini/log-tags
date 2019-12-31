@@ -4,6 +4,7 @@ use std::io;
 use std::io::prelude::*;
 use std::path;
 
+use bit_set::BitSet;
 use regex::Regex;
 
 use crate::error::{Error, Result};
@@ -12,12 +13,44 @@ use crate::error::{Error, Result};
 pub struct FileId(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FilterId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TagId(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Id {
     File(FileId),
+    Filter(FilterId),
     Tag(TagId),
+}
+
+#[derive(Debug)]
+pub enum Comparator {
+    Equal,
+    NotEqual,
+    GreaterThan,
+    GreaterThanEqual,
+    LessThan,
+    LessThanEqual,
+}
+
+#[derive(Debug)]
+pub enum Command {
+    Load(path::PathBuf),
+
+    Tag(FileId, String),
+    Regex(TagId, String),
+    Transform(TagId, String, Option<String>),
+
+    DirectFilter(TagId, Comparator, String),
+    ScriptedFilter(TagId, String, Option<String>),
+
+    // TODO
+    Distinct(TagId, usize),
+    DistinctCounts(TagId, usize),
+
+    Take(FileId, usize),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -35,17 +68,17 @@ impl LuaScript {
     }
 }
 
-struct TagDefinition {
+struct Tag {
     name: String,
     regex: Option<Regex>,
     transform: LuaScript,
 }
 
-impl TagDefinition {
-    fn new<S: Into<String>>(name: S) -> TagDefinition {
-        TagDefinition {
-            regex: None,
+impl Tag {
+    fn new<S: Into<String>>(name: S) -> Tag {
+        Tag {
             name: name.into(),
+            regex: None,
             transform: LuaScript::default(),
         }
     }
@@ -60,64 +93,29 @@ impl TagDefinition {
     }
 }
 
+struct Filter;
+
 #[derive(Default)]
-struct TagDefinitions {
-    definitions: HashMap<TagId, TagDefinition>,
-    order: Vec<TagId>,
+struct FileCache {
+    start: usize,
+    loaded: Vec<String>,
 }
 
-impl<'a> TagDefinitions {
-    fn get(&self, id: &TagId) -> Option<&TagDefinition> {
-        self.definitions.get(id)
-    }
-
-    fn insert(&mut self, id: TagId, definition: TagDefinition) -> Option<TagDefinition> {
-        self.order.push(id);
-        self.definitions.insert(id, definition)
-    }
-
-    fn get_mut(&mut self, id: &TagId) -> Option<&mut TagDefinition> {
-        self.definitions.get_mut(id)
-    }
-
-    fn iter(&self) -> TagDefinitionsIterator {
-        TagDefinitionsIterator {
-            definitions: self,
-            index: 0,
-        }
-    }
-}
-
-struct TagDefinitionsIterator<'a> {
-    definitions: &'a TagDefinitions,
-    index: usize,
-}
-
-impl<'a> Iterator for TagDefinitionsIterator<'a> {
-    type Item = (TagId, &'a TagDefinition);
-
-    fn next(&mut self) -> Option<(TagId, &'a TagDefinition)> {
-        if self.index >= self.definitions.order.len() {
-            return None;
-        }
-
-        let id = self.definitions.order[self.index];
-        let result = self.definitions.get(&id).unwrap();
-        self.index += 1;
-
-        Some((id, result))
+impl FileCache {
+    fn end(&self) -> usize {
+        self.start + self.loaded.len()
     }
 }
 
 type TagValue = Option<String>;
 
 #[derive(Default)]
-struct Tags {
+struct TagCache {
     start: usize,
     loaded: Vec<TagValue>,
 }
 
-impl Tags {
+impl TagCache {
     fn end(&self) -> usize {
         self.start + self.loaded.len()
     }
@@ -127,25 +125,11 @@ impl Tags {
     }
 }
 
-#[derive(Debug)]
-pub enum Command {
-    Load(path::PathBuf),
-    Tag(FileId, String),
-    Regex(TagId, String),
-    Transform(TagId, String, Option<String>),
-    Take(FileId, usize),
-}
-
 #[derive(Default)]
-struct LineCache {
+struct FilterCache {
     start: usize,
-    loaded: Vec<String>,
-}
-
-impl LineCache {
-    fn end(&self) -> usize {
-        self.start + self.loaded.len()
-    }
+    end: usize,
+    loaded: BitSet,
 }
 
 pub struct Output {
@@ -164,22 +148,34 @@ impl Output {
 
 pub struct Engine {
     last_id: usize,
-    files: HashMap<FileId, fs::File>,
-    lines: HashMap<FileId, LineCache>,
-    definitions: HashMap<FileId, TagDefinitions>,
-    tags: HashMap<FileId, HashMap<TagId, Tags>>,
     lua: rlua::Lua,
+
+    files: HashMap<FileId, fs::File>,
+    file_caches: HashMap<FileId, FileCache>,
+
+    tags: HashMap<TagId, Tag>,
+    tag_caches: HashMap<TagId, TagCache>,
+    file_to_tags: HashMap<FileId, Vec<TagId>>,
+
+    filters: HashMap<FilterId, Filter>,
+    filter_caches: HashMap<FilterId, FilterCache>,
 }
 
 impl Engine {
     pub fn new() -> Engine {
         Engine {
             last_id: 0,
-            files: HashMap::new(),
-            lines: HashMap::new(),
-            definitions: HashMap::new(),
-            tags: HashMap::new(),
             lua: rlua::Lua::new(),
+
+            files: HashMap::new(),
+            file_caches: HashMap::new(),
+
+            tags: HashMap::new(),
+            tag_caches: HashMap::new(),
+            file_to_tags: HashMap::new(),
+
+            filters: HashMap::new(),
+            filter_caches: HashMap::new(),
         }
     }
 
@@ -188,37 +184,58 @@ impl Engine {
             Command::Load(path) => {
                 let id = self.next_file_id();
                 self.files.insert(id, fs::File::open(path)?);
-                Ok(Output::new(Id::File(id), vec![format!("loaded {:?}", path)]))
+                Ok(Output::new(
+                    Id::File(id),
+                    vec![format!("loaded {:?}", path)],
+                ))
             }
+
             Command::Tag(file_id, tag_name) => {
                 let tag_id = self.next_tag_id();
+                self.tags.insert(tag_id, Tag::new(tag_name));
 
-                let definitions = self
-                    .definitions
-                    .entry(*file_id)
-                    .or_insert(TagDefinitions::default());
-                definitions.insert(tag_id, TagDefinition::new(tag_name));
+                let tags = self.file_to_tags.entry(*file_id).or_insert(vec![]);
+                tags.push(tag_id);
 
                 Ok(Output::new(Id::Tag(tag_id), vec!["".to_string()]))
             }
             Command::Regex(tag_id, regex) => {
-                let definition = self
-                    .get_mut_definition_by_tag(tag_id)
+                let tag = self
+                    .tags
+                    .get_mut(tag_id)
                     .ok_or_else(|| Error::MissingId(format!("{:?}", tag_id)))?;
-                definition.with_regex(regex)?;
+                tag.with_regex(regex)?;
                 Ok(Output::new(Id::Tag(*tag_id), vec![]))
             }
             Command::Transform(tag_id, transform, setup) => {
                 let script = LuaScript::new(transform, setup.as_ref());
                 self.run_setup(&script)?;
 
-                let definition = self
-                    .get_mut_definition_by_tag(tag_id)
+                let tag = self
+                    .tags
+                    .get_mut(tag_id)
                     .ok_or_else(|| Error::MissingId(format!("{:?}", tag_id)))?;
-                definition.with_script(script);
+                tag.with_script(script);
 
                 Ok(Output::new(Id::Tag(*tag_id), vec![]))
             }
+
+            Command::DirectFilter(tag_id, comparator, value) => {
+                let filter_id = self.next_filter_id();
+                Ok(Output::new(Id::Filter(filter_id), vec![]))
+            }
+            Command::ScriptedFilter(tag_id, test, setup) => {
+                let filter_id = self.next_filter_id();
+
+                let script = LuaScript::new(test, setup.as_ref());
+                self.run_setup(&script)?;
+
+                Ok(Output::new(Id::Filter(filter_id), vec![]))
+            }
+
+            Command::Distinct(tag_id, max) => Ok(Output::new(Id::Tag(*tag_id), vec![])),
+            Command::DistinctCounts(tag_id, max) => Ok(Output::new(Id::Tag(*tag_id), vec![])),
+
             Command::Take(file_id, count) => {
                 self.ensure_lines(*file_id, 0, *count)?;
                 self.ensure_all_tags(*file_id, 0, *count)?;
@@ -252,6 +269,11 @@ impl Engine {
         TagId(self.last_id)
     }
 
+    fn next_filter_id(&mut self) -> FilterId {
+        self.last_id += 1;
+        FilterId(self.last_id)
+    }
+
     fn run_setup(&mut self, script: &LuaScript) -> Result<()> {
         self.lua.context(|lua_ctx| {
             if let Some(ref setup) = script.setup {
@@ -262,7 +284,10 @@ impl Engine {
     }
 
     fn ensure_lines(&mut self, file_id: FileId, start: usize, end: usize) -> Result<()> {
-        let cache = self.lines.entry(file_id).or_insert(LineCache::default());
+        let cache = self
+            .file_caches
+            .entry(file_id)
+            .or_insert(FileCache::default());
         if cache.start > start || cache.end() < end {
             match self.files.get(&file_id) {
                 Some(file) => Engine::cache_lines_from_disk(cache, file, start, end),
@@ -275,7 +300,7 @@ impl Engine {
 
     fn read_lines(&self, file_id: FileId, start: usize, end: usize) -> &[String] {
         assert!(end >= start, "Read end must be larger than start");
-        &self.lines.get(&file_id).unwrap().loaded[start..end]
+        &self.file_caches.get(&file_id).unwrap().loaded[start..end]
     }
 
     fn ensure_tag(
@@ -286,20 +311,17 @@ impl Engine {
         end: usize,
     ) -> Result<()> {
         let (tags_start, tags_end): (usize, usize) = self
-            .tags
-            .get(&file_id)
-            .and_then(|all_tags| all_tags.get(&tag_id))
-            .map(|tags| tags.bounds())
+            .tag_caches
+            .get(&tag_id)
+            .map(|cache| cache.bounds())
             .unwrap_or((0, 0));
 
         if tags_start <= start && tags_end >= end {
             return Ok(());
         }
 
-        let definition = self
-            .definitions
-            .get(&file_id)
-            .ok_or_else(|| Error::MissingId(format!("{:?}", file_id)))?
+        let tag = self
+            .tags
             .get(&tag_id)
             .ok_or_else(|| Error::MissingId(format!("{:?}", tag_id)))?;
 
@@ -308,41 +330,32 @@ impl Engine {
 
         if tags_start > start {
             let lines = self.read_lines(file_id, start, tags_start);
-            prefix = Some(Engine::parse_tag_from_lines(&self.lua, definition, lines));
+            prefix = Some(Engine::parse_tag_from_lines(&self.lua, tag, lines));
         }
 
         if tags_end < end {
             let lines = self.read_lines(file_id, tags_end, end);
-            suffix = Some(Engine::parse_tag_from_lines(&self.lua, definition, lines));
+            suffix = Some(Engine::parse_tag_from_lines(&self.lua, tag, lines));
         }
 
-        let tags = self
-            .tags
-            .entry(file_id)
-            .or_insert(HashMap::new())
-            .entry(tag_id)
-            .or_insert(Tags::default());
+        let cache = self.tag_caches.entry(tag_id).or_insert(TagCache::default());
 
         if let Some(mut prefix) = prefix {
-            prefix.extend(tags.loaded.iter().cloned());
-            tags.loaded = prefix;
-            tags.start = start;
+            prefix.extend(cache.loaded.iter().cloned());
+            cache.loaded = prefix;
+            cache.start = start;
         }
 
         if let Some(suffix) = suffix {
-            tags.loaded.extend(suffix.into_iter());
+            cache.loaded.extend(suffix.into_iter());
         }
 
         Ok(())
     }
 
     fn ensure_all_tags(&mut self, file_id: FileId, start: usize, end: usize) -> Result<()> {
-        if let Some(tag_ids) = self
-            .definitions
-            .get(&file_id)
-            .map(|definitions| definitions.order.clone())
-        {
-            for tag_id in tag_ids {
+        if let Some(tag_ids) = self.file_to_tags.get(&file_id) {
+            for tag_id in tag_ids.clone() {
                 self.ensure_tag(file_id, tag_id, start, end)?;
             }
         }
@@ -350,13 +363,7 @@ impl Engine {
     }
 
     fn read_tag(&self, file_id: FileId, tag_id: TagId, start: usize, end: usize) -> &[TagValue] {
-        &self
-            .tags
-            .get(&file_id)
-            .unwrap()
-            .get(&tag_id)
-            .unwrap()
-            .loaded[start..end]
+        &self.tag_caches.get(&tag_id).unwrap().loaded[start..end]
     }
 
     fn read_all_tags(
@@ -365,19 +372,19 @@ impl Engine {
         start: usize,
         end: usize,
     ) -> Vec<(String, &[TagValue])> {
-        let tag_ids = self
-            .definitions
+        let tags_name_and_id = self
+            .file_to_tags
             .get(&file_id)
-            .map(|definitions| {
-                definitions
+            .map(|tag_ids| {
+                tag_ids
                     .iter()
-                    .map(|(tag_id, definition)| (definition.name.to_string(), tag_id))
+                    .map(|tag_id| (self.tags.get(tag_id).unwrap().name.clone(), *tag_id))
                     .collect()
             })
             .unwrap_or_else(|| vec![]);
 
-        let mut result = Vec::with_capacity(tag_ids.len());
-        for (name, tag_id) in tag_ids {
+        let mut result = Vec::with_capacity(tags_name_and_id.len());
+        for (name, tag_id) in tags_name_and_id {
             result.push((name, self.read_tag(file_id, tag_id, start, end)));
         }
         result
@@ -385,27 +392,27 @@ impl Engine {
 
     fn parse_tag_from_lines(
         lua: &rlua::Lua,
-        definition: &TagDefinition,
+        tag: &Tag,
         lines: &[String],
     ) -> Vec<TagValue> {
         lines
             .iter()
             .map(|line| {
-                if let Some(ref regex) = definition.regex {
+                if let Some(ref regex) = tag.regex {
                     regex.captures(line).and_then(|captures| {
                         captures.get(1).map_or(None, |m| {
-                            Engine::transform_chunk(&lua, &definition.transform, m.as_str()).ok()
+                            Engine::transform_chunk(&lua, &tag.transform, m.as_str()).ok()
                         })
                     })
                 } else {
-                    Engine::transform_chunk(&lua, &definition.transform, line).ok()
+                    Engine::transform_chunk(&lua, &tag.transform, line).ok()
                 }
             })
             .collect()
     }
 
     fn cache_lines_from_disk(
-        cache: &mut LineCache,
+        cache: &mut FileCache,
         file: &fs::File,
         start: usize,
         end: usize,
@@ -439,15 +446,5 @@ impl Engine {
             })?),
             None => Ok(chunk.to_string()),
         }
-    }
-
-    fn get_mut_definition_by_tag(&mut self, id: &TagId) -> Option<&mut TagDefinition> {
-        for definitions in self.definitions.values_mut() {
-            let definition = definitions.get_mut(id);
-            if definition.is_some() {
-                return definition;
-            }
-        }
-        None
     }
 }
