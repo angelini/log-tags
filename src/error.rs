@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::base::Id;
+
 #[derive(Debug)]
 pub enum SyntaxError {
     ExpectedApplication,
@@ -14,10 +16,10 @@ pub enum Error {
     ApplicationOrder,
     FileNotLoaded(String),
     InvalidTarget(String),
-    MissingId(String),
+    MissingId(Id),
     Parser(String),
+    SymbolNotFound(String),
     Syntax(SyntaxError, String),
-    TagDoesNotExist(String),
 }
 
 impl From<rlua::Error> for Error {
@@ -47,12 +49,12 @@ impl fmt::Display for Error {
             Error::ApplicationOrder => write!(f, "Invalid application order"),
             Error::FileNotLoaded(ref path) => write!(f, "File not loaded: {}", path),
             Error::InvalidTarget(ref target) => write!(f, "Invalid target: {}", target),
-            Error::MissingId(ref id) => write!(f, "Missing symbol: {}", id),
+            Error::MissingId(ref id) => write!(f, "Missing ID: {:?}", id),
             Error::Parser(ref err) => write!(f, "Parser error:\n{}", err),
+            Error::SymbolNotFound(ref symbol) => write!(f, "Symbol not found: {}", symbol),
             Error::Syntax(ref kind, ref message) => {
                 write!(f, "Syntax error: {:?} in {}", kind, message)
             }
-            Error::TagDoesNotExist(ref tag) => write!(f, "Tag does not exist: {}", tag),
         }
     }
 }

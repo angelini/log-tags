@@ -10,14 +10,39 @@ use nom::{
     IResult,
 };
 
+use crate::base::Comparator;
+
 type Err<'a> = VerboseError<&'a str>;
 
 #[derive(Clone, Debug)]
 pub enum Expression {
     Application(String, Vec<Expression>),
+    Comparator(Comparator),
     Int(usize),
     String(String),
     Symbol(String),
+}
+
+fn parse_comparator<'a>(i: &'a str) -> IResult<&'a str, Comparator, Err<'a>> {
+    map(
+        alt((
+            tag("=="),
+            tag("!="),
+            tag(">="),
+            tag(">"),
+            tag("<="),
+            tag("<"),
+        )),
+        |comp_str: &str| match comp_str {
+            "==" => Comparator::Equal,
+            "!=" => Comparator::NotEqual,
+            ">" => Comparator::GreaterThan,
+            ">=" => Comparator::GreaterThanEqual,
+            "<" => Comparator::LessThan,
+            "<=" => Comparator::LessThanEqual,
+            _ => unreachable!(),
+        },
+    )(i)
 }
 
 fn parse_int<'a>(i: &'a str) -> IResult<&'a str, usize, Err<'a>> {
@@ -61,6 +86,7 @@ pub fn parse_expression<'a>(i: &'a str) -> IResult<&'a str, Expression, Err<'a>>
         map(parse_application, |(func, args)| {
             Expression::Application(func.to_string(), args)
         }),
+        map(parse_comparator, Expression::Comparator),
         map(parse_int, Expression::Int),
         map(parse_double_quoted_str, Expression::String),
         map(parse_symbol, Expression::Symbol),
