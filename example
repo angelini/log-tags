@@ -1,0 +1,6 @@
+> load('log, "apache.log")
+
+> tag('log, 'level)
+| regex("\[(error|notice)\]")
+| filter(==, "error")
+| take(5)

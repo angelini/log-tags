@@ -6,9 +6,10 @@ edition = "2018"
 
 [dependencies]
 bit-set = "0.5"
+clap = "2"
 regex = "1"
 rlua = "0.17"
-rustyline = "5.0"
+rustyline = "6"
 
 [dependencies.nom]
 version = "5.0"

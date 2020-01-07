@@ -1,5 +1,3 @@
-use std::cmp;
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileId(pub usize);
 

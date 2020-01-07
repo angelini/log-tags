@@ -178,7 +178,7 @@ impl Engine {
                 let tag_id = self.next_tag_id();
                 self.tags.insert(tag_id, Tag::new(tag_name));
 
-                let tags = self.file_to_tags.entry(*file_id).or_insert(vec![]);
+                let tags = self.file_to_tags.entry(*file_id).or_insert_with(|| vec![]);
                 tags.push(tag_id);
 
                 Ok(Output::new(Id::Tag(tag_id), vec!["".to_string()]))
@@ -255,7 +255,7 @@ impl Engine {
                     }
                     Id::Filter(filter_id) => {
                         let file_id = self
-                            .filter_to_file(filter_id)
+                            .filter_to_file(*filter_id)
                             .ok_or_else(|| Error::MissingId(Id::Filter(*filter_id)))?;
                         let tag_id = *self
                             .filter_to_tag
@@ -343,7 +343,7 @@ impl Engine {
         let cache = self
             .file_caches
             .entry(file_id)
-            .or_insert(FileCache::default());
+            .or_insert_with(FileCache::default);
         let cache_bounds = cache.bounds();
 
         if cache_bounds.contains(interval) {
@@ -414,7 +414,7 @@ impl Engine {
             suffix = Some(Engine::parse_tag_from_lines(&self.lua, tag, lines));
         }
 
-        let cache = self.tag_caches.entry(tag_id).or_insert(TagCache::default());
+        let cache = self.tag_caches.entry(tag_id).or_insert_with(TagCache::default);
 
         if let Some(mut prefix) = prefix {
             prefix.extend(cache.loaded.iter().cloned());
@@ -470,7 +470,7 @@ impl Engine {
         let cache = self
             .filter_caches
             .entry(filter_id)
-            .or_insert(FilterCache::default());
+            .or_insert_with(FilterCache::default);
         let cache_bounds = cache.bounds();
 
         if cache_bounds.contains(interval) {
@@ -510,7 +510,7 @@ impl Engine {
         let cache = self
             .filter_caches
             .entry(filter_id)
-            .or_insert(FilterCache::default());
+            .or_insert_with(FilterCache::default);
 
         if let Some(mut prefix) = prefix {
             prefix.union_with(&cache.loaded);
@@ -536,7 +536,7 @@ impl Engine {
             .map(|line| {
                 if let Some(ref regex) = tag.regex {
                     regex.captures(line).and_then(|captures| {
-                        captures.get(1).map_or(None, |m| {
+                        captures.get(1).and_then(|m| {
                             Engine::transform_chunk(&lua, &tag.transform, m.as_str()).ok()
                         })
                     })
@@ -590,7 +590,7 @@ impl Engine {
         }
     }
 
-    fn filter_to_file(&self, filter_id: &FilterId) -> Option<FileId> {
+    fn filter_to_file(&self, filter_id: FilterId) -> Option<FileId> {
         self.filter_to_tag.get(&filter_id).and_then(|tag_id| {
             for (file_id, tag_ids) in &self.file_to_tags {
                 if tag_ids.contains(tag_id) {

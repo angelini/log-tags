@@ -12,6 +12,7 @@ pub enum SyntaxError {
 pub enum Error {
     Lua(rlua::Error),
     Io(std::io::Error),
+    Readline(rustyline::error::ReadlineError),
     Regex(regex::Error),
     ApplicationOrder,
     FileNotLoaded(String),
@@ -34,6 +35,12 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<rustyline::error::ReadlineError> for Error {
+    fn from(err: rustyline::error::ReadlineError) -> Error {
+        Error::Readline(err)
+    }
+}
+
 impl From<regex::Error> for Error {
     fn from(err: regex::Error) -> Error {
         Error::Regex(err)
@@ -45,6 +52,7 @@ impl fmt::Display for Error {
         match *self {
             Error::Lua(ref err) => write!(f, "{}", err),
             Error::Io(ref err) => write!(f, "{}", err),
+            Error::Readline(ref err) => write!(f, "{}", err),
             Error::Regex(ref err) => write!(f, "{}", err),
             Error::ApplicationOrder => write!(f, "Invalid application order"),
             Error::FileNotLoaded(ref path) => write!(f, "File not loaded: {}", path),
