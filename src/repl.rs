@@ -316,8 +316,8 @@ impl Repl {
                 }
             }
             Application::TakePipe(count) => {
-                if let Some(Id::File(file_id)) = target {
-                    engine.run_command(&Command::Take(Id::File(file_id), count))
+                if let Some(id) = target {
+                    engine.run_command(&Command::Take(id, count))
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
                 }
@@ -398,7 +398,6 @@ pub fn start(mut engine: &mut Engine) -> Result<()> {
                         if applications.is_empty() {
                             return Err(Error::ApplicationOrder);
                         }
-                        println!("app: {:?}", app);
                         applications.push(app);
                         rl.add_history_entry(line);
                         line = String::new();

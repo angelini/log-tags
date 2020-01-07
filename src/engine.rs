@@ -126,6 +126,8 @@ impl Output {
     }
 }
 
+const BATCH_SIZE: usize = 10;
+
 pub struct Engine {
     last_id: usize,
     lua: rlua::Lua,
@@ -228,10 +230,10 @@ impl Engine {
             Command::DistinctCounts(tag_id, max) => Ok(Output::new(Id::Tag(*tag_id), vec![])),
 
             Command::Take(id, count) => {
-                let interval = Interval(0, *count);
-
                 match id {
                     Id::File(file_id) => {
+                        let interval = Interval(0, *count);
+
                         self.ensure_file(*file_id, interval)?;
                         self.ensure_all_tags(*file_id, interval)?;
 
@@ -260,15 +262,33 @@ impl Engine {
                             .get(filter_id)
                             .ok_or_else(|| Error::MissingId(Id::Filter(*filter_id)))?;
 
-                        self.ensure_file(file_id, interval)?;
-                        self.ensure_tag(file_id, tag_id, interval)?;
-                        self.ensure_filter(tag_id, *filter_id, interval)?;
+                        let mut index = 0;
+                        let mut current_count = 0;
 
-                        let filter = self.read_filter(*filter_id);
+                        while current_count < *count {
+                            let interval = Interval(index, index + BATCH_SIZE);
+
+                            self.ensure_file(file_id, interval)?;
+                            self.ensure_tag(file_id, tag_id, interval)?;
+                            self.ensure_filter(tag_id, *filter_id, interval)?;
+
+                            let filter = self.read_filter(*filter_id);
+
+                            index += BATCH_SIZE;
+                            current_count = filter.iter().count();
+                        }
+
+                        let interval = Interval(0, index + BATCH_SIZE);
+
+                        self.ensure_all_tags(file_id, interval)?;
+
                         let lines = self.read_lines(file_id, interval);
                         let tags = self.read_all_tags(file_id, interval);
+                        let filter = self.read_filter(*filter_id);
 
                         let mut output = vec![];
+                        let mut current_count = 0;
+
                         for (idx, line) in lines.iter().enumerate() {
                             if !filter.contains(idx) {
                                 continue;
@@ -280,6 +300,11 @@ impl Engine {
                                     format!("[{}]", name),
                                     tag_values[idx]
                                 ))
+                            }
+
+                            current_count += 1;
+                            if current_count >= *count {
+                                break;
                             }
                         }
                         Ok(Output::new(Id::Filter(*filter_id), output))
