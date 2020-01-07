@@ -102,3 +102,60 @@ function parse_date (d)
 end
 """)
 | transform("parse_date(data)")
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+> load('log, "apache.log")
+|
+
+> tag('log, 'level)
+| regex("\[(error|notice)\]")
+|
+
+> filter('level, ==, "error")
+| take(5)
+|
+
+> filter('log-error, 'level, ==, "error")
+|
+
+> take('log-error, 5)
+|
+
+> tag('log, 'other)
+| filter(==, "10")
+| take(5)
+|
+
+> tag('log, 'other)
+| filter('other-10, ==, "10)
+|
+
+> take('other-10, 5)
+|
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+Cache A: [0, 15]
+      B: [0, 0]
+      C: [4, 12]
+
+Take(A, 5): [0, 5]
+MissingBefore: [0, 0]
+MissingAfter:  [15, 15]
+
+Take(C, 5): [0, 5]
+Missing Before: [0, 4]
+Missing After:  [12, 12]
+
+Take(B, 1): [0, 1]
+MissingBefore: [0, 0]
+MissingAfter:  [0, 1]
+
+Take(C, 15): [0, 15]
+MissingBefore: [0, 4]
+MissingAfter:  [12, 15]
+
+Take(A, 20): [0, 20]
+MissingBefore: [0, 0]
+MissingAfter:  [15, 20]
