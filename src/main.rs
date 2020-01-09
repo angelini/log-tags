@@ -33,7 +33,9 @@ fn main() -> Result<()> {
         let mut state = CursorState::Root;
 
         for segment in file.lines().map(|l| l.unwrap()) {
-            println!("{}", segment);
+            if !segment.is_empty() {
+                println!("{}", segment);
+            }
 
             match state {
                 CursorState::Root => {
@@ -45,11 +47,12 @@ fn main() -> Result<()> {
                     if segment.len() > 2 && &segment[0..2] == "| " {
                         state = interpreter.add_line_segment(&segment[2..])?
                     }
-                    if segment.len() == 0 {
+                    if segment.is_empty() {
+                        println!();
                         for line in interpreter.execute(&mut engine)? {
                             println!("  {}", line);
                         }
-                        println!("");
+                        println!();
                         state = CursorState::Root;
                     }
                 }
@@ -59,10 +62,11 @@ fn main() -> Result<()> {
             }
         }
 
+        println!();
         for line in interpreter.execute(&mut engine)? {
             println!("  {}", line);
         }
-        println!("");
+        println!();
     }
 
     repl::start(&mut engine, &mut interpreter).map_err(|e| {

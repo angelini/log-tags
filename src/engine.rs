@@ -120,8 +120,8 @@ pub struct Output {
 impl Output {
     fn new(id: Id, lines: Vec<String>) -> Output {
         Output {
-            id: id,
-            lines: lines,
+            id,
+            lines,
         }
     }
 }
@@ -181,7 +181,7 @@ impl Engine {
                 let tags = self.file_to_tags.entry(*file_id).or_insert_with(|| vec![]);
                 tags.push(tag_id);
 
-                Ok(Output::new(Id::Tag(tag_id), vec!["".to_string()]))
+                Ok(Output::new(Id::Tag(tag_id), vec![]))
             }
             Command::Regex(tag_id, regex) => {
                 let tag = self
@@ -232,9 +232,8 @@ impl Engine {
             Command::Take(id, count) => {
                 match id {
                     Id::File(file_id) => {
-                        let interval = Interval(0, *count);
-
-                        self.ensure_file(*file_id, interval)?;
+                        let lines_read = self.ensure_file(*file_id, Interval(0, *count))?;
+                        let interval = Interval(0, lines_read);
                         self.ensure_all_tags(*file_id, interval)?;
 
                         let lines = self.read_lines(*file_id, interval);
@@ -266,20 +265,21 @@ impl Engine {
                         let mut current_count = 0;
 
                         while current_count < *count {
-                            let interval = Interval(index, index + BATCH_SIZE);
+                            let lines_read = self.ensure_file(file_id, Interval(index, index + BATCH_SIZE))?;
+                            if lines_read == 0 {
+                                break
+                            }
 
-                            self.ensure_file(file_id, interval)?;
+                            let interval = Interval(index, index + lines_read);
                             self.ensure_tag(file_id, tag_id, interval)?;
                             self.ensure_filter(tag_id, *filter_id, interval)?;
 
                             let filter = self.read_filter(*filter_id);
-
-                            index += BATCH_SIZE;
+                            index += lines_read;
                             current_count = filter.iter().count();
                         }
 
-                        let interval = Interval(0, index + BATCH_SIZE);
-
+                        let interval = Interval(0, index);
                         self.ensure_all_tags(file_id, interval)?;
 
                         let lines = self.read_lines(file_id, interval);
@@ -339,7 +339,7 @@ impl Engine {
         })
     }
 
-    fn ensure_file(&mut self, file_id: FileId, interval: Interval) -> Result<()> {
+    fn ensure_file(&mut self, file_id: FileId, interval: Interval) -> Result<usize> {
         let cache = self
             .file_caches
             .entry(file_id)
@@ -347,7 +347,7 @@ impl Engine {
         let cache_bounds = cache.bounds();
 
         if cache_bounds.contains(interval) {
-            return Ok(());
+            return Ok(std::cmp::min(cache_bounds.1 - interval.0, interval.len()));
         }
 
         if let Some(file) = self.files.get(&file_id) {
@@ -373,7 +373,7 @@ impl Engine {
                 cache.loaded.extend(lines.into_iter());
             }
 
-            Ok(())
+            Ok(std::cmp::min(cache.bounds().1 - interval.0, interval.len()))
         } else {
             Err(Error::FileNotLoaded(format!("{:?}", file_id)))
         }

@@ -33,6 +33,10 @@ impl Interval {
         self.0 == self.1
     }
 
+    pub fn len(&self) -> usize {
+        self.1 - self.0
+    }
+
     pub fn contains(&self, other: Interval) -> bool {
         other.is_empty()
             || (self.missing_before(other).is_empty() && self.missing_after(other).is_empty())
