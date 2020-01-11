@@ -4,3 +4,19 @@
 | regex("\[(error|notice)\]")
 | filter(==, "error")
 | take(5)
+
+> filter('level, ==, "notice")
+| take(5)
+
+> tag('log, 'hour)
+| regex("(\d+):")
+
+> filter('hour, >, "05")
+| take(5)
+
+> filter('hour, <, "05")
+| take(5)
+
+> filter('hour, <, "24")
+| filter(>, "08")
+| take(5)
