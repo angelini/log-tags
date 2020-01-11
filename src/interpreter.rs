@@ -237,9 +237,7 @@ impl Interpreter {
                 self.line = String::new();
                 Ok(CursorState::Pipelined)
             }
-            ParseState::Empty => {
-                Ok(CursorState::Root)
-            }
+            ParseState::Empty => Ok(CursorState::Root),
         }
     }
 
@@ -282,10 +280,7 @@ impl Interpreter {
                 if let Some(Id::File(file_id)) = target {
                     let output =
                         engine.run_command(&Command::Tag(file_id, tag_name.to_string()))?;
-                    *self
-                        .symbols
-                        .entry(tag_name)
-                        .or_insert(output.id) = output.id;
+                    *self.symbols.entry(tag_name).or_insert(output.id) = output.id;
                     Ok(output)
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
@@ -323,16 +318,16 @@ impl Interpreter {
             }
 
             Application::DirectFilter(tag_name, comparator, value) => {
-                if let Some(Id::Tag(tag_id)) = self.symbols.get(&tag_name) {
-                    engine.run_command(&Command::DirectFilter(*tag_id, comparator, value))
+                if let Some(id) = self.symbols.get(&tag_name) {
+                    engine.run_command(&Command::DirectFilter(*id, comparator, value))
                 } else {
                     Err(Error::SymbolNotFound(tag_name))
                 }
             }
             Application::DirectFilterNamed(tag_name, filter_name, comparator, value) => {
-                if let Some(Id::Tag(tag_id)) = self.symbols.get(&tag_name) {
+                if let Some(id) = self.symbols.get(&tag_name) {
                     let output =
-                        engine.run_command(&Command::DirectFilter(*tag_id, comparator, value))?;
+                        engine.run_command(&Command::DirectFilter(*id, comparator, value))?;
                     *self.symbols.entry(filter_name).or_insert(output.id) = output.id;
                     Ok(output)
                 } else {
@@ -340,16 +335,16 @@ impl Interpreter {
                 }
             }
             Application::DirectFilterPiped(comparator, value) => {
-                if let Some(Id::Tag(tag_id)) = target {
-                    engine.run_command(&Command::DirectFilter(tag_id, comparator, value))
+                if let Some(id) = target {
+                    engine.run_command(&Command::DirectFilter(id, comparator, value))
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
                 }
             }
             Application::DirectFilterPipedNamed(filter_name, comparator, value) => {
-                if let Some(Id::Tag(tag_id)) = target {
+                if let Some(id) = target {
                     let output =
-                        engine.run_command(&Command::DirectFilter(tag_id, comparator, value))?;
+                        engine.run_command(&Command::DirectFilter(id, comparator, value))?;
                     *self.symbols.entry(filter_name).or_insert(output.id) = output.id;
                     Ok(output)
                 } else {
@@ -358,16 +353,16 @@ impl Interpreter {
             }
 
             Application::ScriptedFilter(tag_name, test, setup) => {
-                if let Some(Id::Tag(tag_id)) = self.symbols.get(&tag_name) {
-                    engine.run_command(&Command::ScriptedFilter(*tag_id, test, setup))
+                if let Some(id) = self.symbols.get(&tag_name) {
+                    engine.run_command(&Command::ScriptedFilter(*id, test, setup))
                 } else {
                     Err(Error::SymbolNotFound(tag_name))
                 }
             }
             Application::ScriptedFilterNamed(tag_name, filter_name, test, setup) => {
-                if let Some(Id::Tag(tag_id)) = self.symbols.get(&tag_name) {
+                if let Some(id) = self.symbols.get(&tag_name) {
                     let output =
-                        engine.run_command(&Command::ScriptedFilter(*tag_id, test, setup))?;
+                        engine.run_command(&Command::ScriptedFilter(*id, test, setup))?;
                     *self.symbols.entry(filter_name).or_insert(output.id) = output.id;
                     Ok(output)
                 } else {
@@ -375,16 +370,16 @@ impl Interpreter {
                 }
             }
             Application::ScriptedFilterPiped(test, setup) => {
-                if let Some(Id::Tag(tag_id)) = target {
-                    engine.run_command(&Command::ScriptedFilter(tag_id, test, setup))
+                if let Some(id) = target {
+                    engine.run_command(&Command::ScriptedFilter(id, test, setup))
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
                 }
             }
             Application::ScriptedFilterPipedNamed(filter_name, test, setup) => {
-                if let Some(Id::Tag(tag_id)) = target {
+                if let Some(id) = target {
                     let output =
-                        engine.run_command(&Command::ScriptedFilter(tag_id, test, setup))?;
+                        engine.run_command(&Command::ScriptedFilter(id, test, setup))?;
                     *self.symbols.entry(filter_name).or_insert(output.id) = output.id;
                     Ok(output)
                 } else {

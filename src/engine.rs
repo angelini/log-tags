@@ -18,8 +18,8 @@ pub enum Command {
     Regex(TagId, String),
     Transform(TagId, String, Option<String>),
 
-    DirectFilter(TagId, Comparator, String),
-    ScriptedFilter(TagId, String, Option<String>),
+    DirectFilter(Id, Comparator, String),
+    ScriptedFilter(Id, String, Option<String>),
 
     // TODO
     Distinct(TagId, usize),
@@ -29,9 +29,9 @@ pub enum Command {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct LuaScript {
-    setup: Option<String>,
-    eval: Option<String>,
+struct LuaScript {
+    pub setup: Option<String>,
+    pub eval: Option<String>,
 }
 
 impl LuaScript {
@@ -44,9 +44,9 @@ impl LuaScript {
 }
 
 struct Tag {
-    name: String,
-    regex: Option<Regex>,
-    transform: LuaScript,
+    pub name: String,
+    pub regex: Option<Regex>,
+    pub transform: LuaScript,
 }
 
 impl Tag {
@@ -66,6 +66,11 @@ impl Tag {
     fn with_script(&mut self, script: LuaScript) {
         self.transform = script;
     }
+}
+
+enum Filter {
+    Direct(Comparator, String),
+    Scripted(LuaScript),
 }
 
 #[derive(Default)]
@@ -94,16 +99,17 @@ impl Bounded for TagCache {
     }
 }
 
-enum Filter {
-    Direct(Comparator, String),
-    Scripted(LuaScript),
-}
-
 #[derive(Default)]
 struct FilterCache {
     start: usize,
     end: usize,
     loaded: BitSet,
+}
+
+impl FilterCache {
+    fn count(&self) -> usize {
+        self.loaded.iter().count()
+    }
 }
 
 impl Bounded for FilterCache {
@@ -119,14 +125,65 @@ pub struct Output {
 
 impl Output {
     fn new(id: Id, lines: Vec<String>) -> Output {
-        Output {
-            id,
-            lines,
+        Output { id, lines }
+    }
+}
+
+struct ReadIntervals {
+    index: usize,
+    next: usize,
+    max: usize,
+}
+
+impl ReadIntervals {
+    fn new(min: usize, max: usize) -> ReadIntervals {
+        ReadIntervals {
+            index: 0,
+            next: std::cmp::min(min, max),
+            max: max,
         }
     }
 }
 
-const BATCH_SIZE: usize = 10;
+impl Iterator for ReadIntervals {
+    type Item = Interval;
+
+    fn next(&mut self) -> Option<Interval> {
+        let interval = Interval(self.index, self.index + self.next);
+        self.index += self.next;
+        self.next = std::cmp::min(self.max, self.next * 2);
+        Some(interval)
+    }
+}
+
+const MAX_BATCH_SIZE: usize = 1024;
+
+struct Plan {
+    steps: Vec<Id>,
+}
+
+impl Plan {
+    fn new(steps: Vec<Id>) -> Plan {
+        Plan { steps }
+    }
+
+    fn file_id(&self) -> FileId {
+        match self.steps[0] {
+            Id::File(file_id) => file_id,
+            _ => panic!(),
+        }
+    }
+
+    fn filter_ids(&self) -> Vec<FilterId> {
+        self.steps
+            .iter()
+            .filter_map(|step| match step {
+                Id::Filter(filter_id) => Some(*filter_id),
+                _ => None,
+            })
+            .collect()
+    }
+}
 
 pub struct Engine {
     last_id: usize,
@@ -141,7 +198,7 @@ pub struct Engine {
 
     filters: HashMap<FilterId, Filter>,
     filter_caches: HashMap<FilterId, FilterCache>,
-    filter_to_tag: HashMap<FilterId, TagId>,
+    filter_to_parent: HashMap<FilterId, Id>,
 }
 
 impl Engine {
@@ -159,7 +216,7 @@ impl Engine {
 
             filters: HashMap::new(),
             filter_caches: HashMap::new(),
-            filter_to_tag: HashMap::new(),
+            filter_to_parent: HashMap::new(),
         }
     }
 
@@ -204,16 +261,16 @@ impl Engine {
                 Ok(Output::new(Id::Tag(*tag_id), vec![]))
             }
 
-            Command::DirectFilter(tag_id, comparator, value) => {
+            Command::DirectFilter(id, comparator, value) => {
                 let filter_id = self.next_filter_id();
 
                 let filter = Filter::Direct(*comparator, value.clone());
                 self.filters.insert(filter_id, filter);
-                self.filter_to_tag.insert(filter_id, *tag_id);
+                self.filter_to_parent.insert(filter_id, *id);
 
                 Ok(Output::new(Id::Filter(filter_id), vec![]))
             }
-            Command::ScriptedFilter(tag_id, test, setup) => {
+            Command::ScriptedFilter(id, test, setup) => {
                 let filter_id = self.next_filter_id();
 
                 let script = LuaScript::new(test, setup.as_ref());
@@ -221,7 +278,7 @@ impl Engine {
 
                 let filter = Filter::Scripted(script);
                 self.filters.insert(filter_id, filter);
-                self.filter_to_tag.insert(filter_id, *tag_id);
+                self.filter_to_parent.insert(filter_id, *id);
 
                 Ok(Output::new(Id::Filter(filter_id), vec![]))
             }
@@ -229,89 +286,7 @@ impl Engine {
             Command::Distinct(tag_id, max) => Ok(Output::new(Id::Tag(*tag_id), vec![])),
             Command::DistinctCounts(tag_id, max) => Ok(Output::new(Id::Tag(*tag_id), vec![])),
 
-            Command::Take(id, count) => {
-                match id {
-                    Id::File(file_id) => {
-                        let lines_read = self.ensure_file(*file_id, Interval(0, *count))?;
-                        let interval = Interval(0, lines_read);
-                        self.ensure_all_tags(*file_id, interval)?;
-
-                        let lines = self.read_lines(*file_id, interval);
-                        let tags = self.read_all_tags(*file_id, interval);
-
-                        let mut output = vec![];
-                        for (idx, line) in lines.iter().enumerate() {
-                            output.push(line.to_string());
-                            for (name, tag_values) in &tags {
-                                output.push(format!(
-                                    "    {: <15} {:?}",
-                                    format!("[{}]", name),
-                                    tag_values[idx]
-                                ))
-                            }
-                        }
-                        Ok(Output::new(Id::File(*file_id), output))
-                    }
-                    Id::Filter(filter_id) => {
-                        let file_id = self
-                            .filter_to_file(*filter_id)
-                            .ok_or_else(|| Error::MissingId(Id::Filter(*filter_id)))?;
-                        let tag_id = *self
-                            .filter_to_tag
-                            .get(filter_id)
-                            .ok_or_else(|| Error::MissingId(Id::Filter(*filter_id)))?;
-
-                        let mut index = 0;
-                        let mut current_count = 0;
-
-                        while current_count < *count {
-                            let lines_read = self.ensure_file(file_id, Interval(index, index + BATCH_SIZE))?;
-                            if lines_read == 0 {
-                                break
-                            }
-
-                            let interval = Interval(index, index + lines_read);
-                            self.ensure_tag(file_id, tag_id, interval)?;
-                            self.ensure_filter(tag_id, *filter_id, interval)?;
-
-                            let filter = self.read_filter(*filter_id);
-                            index += lines_read;
-                            current_count = filter.iter().count();
-                        }
-
-                        let interval = Interval(0, index);
-                        self.ensure_all_tags(file_id, interval)?;
-
-                        let lines = self.read_lines(file_id, interval);
-                        let tags = self.read_all_tags(file_id, interval);
-                        let filter = self.read_filter(*filter_id);
-
-                        let mut output = vec![];
-                        let mut current_count = 0;
-
-                        for (idx, line) in lines.iter().enumerate() {
-                            if !filter.contains(idx) {
-                                continue;
-                            }
-                            output.push(line.to_string());
-                            for (name, tag_values) in &tags {
-                                output.push(format!(
-                                    "    {: <15} {:?}",
-                                    format!("[{}]", name),
-                                    tag_values[idx]
-                                ))
-                            }
-
-                            current_count += 1;
-                            if current_count >= *count {
-                                break;
-                            }
-                        }
-                        Ok(Output::new(Id::Filter(*filter_id), output))
-                    }
-                    Id::Tag(_) => panic!(),
-                }
-            }
+            Command::Take(id, count) => Ok(Output::new(*id, self.take(&self.plan(*id), *count)?)),
         }
     }
 
@@ -328,6 +303,107 @@ impl Engine {
     fn next_filter_id(&mut self) -> FilterId {
         self.last_id += 1;
         FilterId(self.last_id)
+    }
+
+    fn plan(&self, id: Id) -> Plan {
+        Plan::new(self.plan_steps(id))
+    }
+
+    fn plan_steps(&self, id: Id) -> Vec<Id> {
+        match id {
+            Id::File(_) => vec![id],
+            Id::Tag(tag_id) => {
+                let mut parent = self.plan_steps(Id::File(self.tag_to_file(tag_id).unwrap()));
+                parent.push(id);
+                parent
+            }
+            Id::Filter(filter_id) => {
+                let mut parent = self.plan_steps(self.filter_to_parent[&filter_id]);
+                parent.push(id);
+                parent
+            }
+        }
+    }
+
+    fn take(&mut self, plan: &Plan, count: usize) -> Result<Vec<String>> {
+        let mut interval = Interval(0, 0);
+
+        'outer: for batch_interval in ReadIntervals::new(count, MAX_BATCH_SIZE) {
+            for id in &plan.steps {
+                match id {
+                    Id::File(file_id) => {
+                        let read_count = self.ensure_file(*file_id, batch_interval)?;
+                        if read_count == 0 {
+                            break 'outer;
+                        }
+                        interval.1 += read_count;
+                    }
+                    Id::Tag(tag_id) => {
+                        self.ensure_tag(self.tag_to_file(*tag_id).unwrap(), *tag_id, interval)?;
+                    }
+                    Id::Filter(filter_id) => {
+                        self.ensure_filter(self.filter_to_tag(*filter_id).unwrap(), *filter_id, interval)?;
+                    }
+                }
+            }
+
+            match plan.steps.last().unwrap() {
+                Id::File(file_id) => {
+                    if self.file_caches[file_id].bounds().len() >= count {
+                        break;
+                    }
+                }
+                Id::Filter(filter_id) => {
+                    if self.filter_caches[filter_id].count() >= count {
+                        break;
+                    }
+                }
+                Id::Tag(tag_id) => {
+                    if self.tag_caches[tag_id].bounds().len() >= count {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let file_id = plan.file_id();
+        self.ensure_all_tags(plan.file_id(), interval)?;
+
+        let lines = self.read_lines(file_id, interval);
+        let tags = self.read_all_tags(file_id, interval);
+
+        let mut combined_filter: Option<BitSet> = None;
+        for filter_id in plan.filter_ids() {
+            match combined_filter {
+                Some(ref mut filter) => filter.intersect_with(self.read_filter(filter_id)),
+                None => combined_filter = Some(self.read_filter(filter_id).clone()),
+            }
+        }
+
+        let mut output = vec![];
+        let mut current_count = 0;
+
+        for (idx, line) in lines.iter().enumerate() {
+            if let Some(filter) = &combined_filter {
+                if !filter.contains(idx) {
+                    continue;
+                }
+            }
+            output.push(line.to_string());
+            for (name, tag_values) in &tags {
+                output.push(format!(
+                    "    {: <15} {:?}",
+                    format!("[{}]", name),
+                    tag_values[idx]
+                ))
+            }
+
+            current_count += 1;
+            if current_count >= count {
+                break;
+            }
+        }
+        Ok(output)
     }
 
     fn run_setup(&mut self, script: &LuaScript) -> Result<()> {
@@ -373,7 +449,10 @@ impl Engine {
                 cache.loaded.extend(lines.into_iter());
             }
 
-            Ok(std::cmp::min(cache.bounds().1 - interval.0, interval.len()))
+            Ok(std::cmp::min(
+                cache.bounds().1 - std::cmp::min(cache.bounds().1, interval.0),
+                interval.len(),
+            ))
         } else {
             Err(Error::FileNotLoaded(format!("{:?}", file_id)))
         }
@@ -414,7 +493,10 @@ impl Engine {
             suffix = Some(Engine::parse_tag_from_lines(&self.lua, tag, lines));
         }
 
-        let cache = self.tag_caches.entry(tag_id).or_insert_with(TagCache::default);
+        let cache = self
+            .tag_caches
+            .entry(tag_id)
+            .or_insert_with(TagCache::default);
 
         if let Some(mut prefix) = prefix {
             prefix.extend(cache.loaded.iter().cloned());
@@ -554,20 +636,20 @@ impl Engine {
         start: usize,
     ) -> BitSet {
         match filter {
-            Filter::Direct(comp, value) => {
+            Filter::Direct(comp, right) => {
                 let mut result = BitSet::new();
-                for (idx, tag_value) in values.iter().enumerate() {
-                    match (comp, tag_value) {
-                        (Comparator::Equal, Some(v)) if value == v => result.insert(start + idx),
-                        (Comparator::NotEqual, Some(v)) if value != v => result.insert(start + idx),
-                        (Comparator::GreaterThan, Some(v)) if value > v => {
+                for (idx, left_option) in values.iter().enumerate() {
+                    match (comp, left_option) {
+                        (Comparator::Equal, Some(left)) if left == right => result.insert(start + idx),
+                        (Comparator::NotEqual, Some(left)) if left != right => result.insert(start + idx),
+                        (Comparator::GreaterThan, Some(left)) if left > right => {
                             result.insert(start + idx)
                         }
-                        (Comparator::GreaterThanEqual, Some(v)) if value >= v => {
+                        (Comparator::GreaterThanEqual, Some(left)) if left >= right => {
                             result.insert(start + idx)
                         }
-                        (Comparator::LessThan, Some(v)) if value < v => result.insert(start + idx),
-                        (Comparator::LessThanEqual, Some(v)) if value <= v => {
+                        (Comparator::LessThan, Some(left)) if left < right => result.insert(start + idx),
+                        (Comparator::LessThanEqual, Some(left)) if left <= right => {
                             result.insert(start + idx)
                         }
                         (_, None) => continue,
@@ -590,14 +672,20 @@ impl Engine {
         }
     }
 
-    fn filter_to_file(&self, filter_id: FilterId) -> Option<FileId> {
-        self.filter_to_tag.get(&filter_id).and_then(|tag_id| {
-            for (file_id, tag_ids) in &self.file_to_tags {
-                if tag_ids.contains(tag_id) {
-                    return Some(*file_id);
-                }
+    fn tag_to_file(&self, tag_id: TagId) -> Option<FileId> {
+        for (file_id, tag_ids) in &self.file_to_tags {
+            if tag_ids.contains(&tag_id) {
+                return Some(*file_id);
             }
-            None
-        })
+        }
+        None
+    }
+
+    fn filter_to_tag(&self, filter_id: FilterId) -> Option<TagId> {
+        match self.filter_to_parent[&filter_id] {
+            Id::File(fid) => None,
+            Id::Filter(fid) => self.filter_to_tag(fid),
+            Id::Tag(tid) => Some(tid)
+        }
     }
 }
