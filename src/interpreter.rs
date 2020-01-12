@@ -11,6 +11,7 @@ use crate::parser::{self, Expression};
 #[derive(Debug)]
 pub enum Application {
     Load(String, String),
+    Script(String),
 
     Tag(String, String),
     TagPiped(String),
@@ -18,21 +19,21 @@ pub enum Application {
     Regex(String, String),
     RegexPiped(String),
 
-    Transform(String, String, Option<String>),
-    TransformPiped(String, Option<String>),
+    Transform(String, String),
+    TransformPiped(String),
 
     DirectFilter(String, Comparator, String),
     DirectFilterNamed(String, String, Comparator, String),
     DirectFilterPiped(Comparator, String),
     DirectFilterPipedNamed(String, Comparator, String),
 
-    ScriptedFilter(String, String, Option<String>),
-    ScriptedFilterNamed(String, String, String, Option<String>),
-    ScriptedFilterPiped(String, Option<String>),
-    ScriptedFilterPipedNamed(String, String, Option<String>),
+    ScriptedFilter(String, String),
+    ScriptedFilterNamed(String, String, String),
+    ScriptedFilterPiped(String),
+    ScriptedFilterPipedNamed(String, String),
 
     Take(String, usize),
-    TakePipe(usize),
+    TakePiped(usize),
 }
 
 impl Application {
@@ -46,6 +47,10 @@ impl Application {
                 ("load",
                  [Expression::Symbol(file), Expression::String(path)]) => {
                     Ok(Application::Load(file.clone(), path.clone()))
+                }
+                ("script",
+                 [Expression::String(script)]) => {
+                    Ok(Application::Script(script.clone()))
                 }
 
                 ("tag",
@@ -67,20 +72,12 @@ impl Application {
                 }
 
                 ("transform",
-                 [Expression::Symbol(tag), Expression::String(transform), Expression::String(setup)]) => {
-                    Ok(Application::Transform(tag.clone(), transform.clone(), Some(setup.clone())))
-                }
-                ("transform",
                  [Expression::Symbol(tag), Expression::String(transform)]) => {
-                    Ok(Application::Transform(tag.clone(), transform.clone(), None))
+                    Ok(Application::Transform(tag.clone(), transform.clone()))
                 }
-                ("transform",
-                 [Expression::String(transform), Expression::String(setup)]) => Ok(
-                    Application::TransformPiped(transform.clone(), Some(setup.clone())),
-                ),
                 ("transform",
                  [Expression::String(transform)]) => {
-                    Ok(Application::TransformPiped(transform.clone(), None))
+                    Ok(Application::TransformPiped(transform.clone()))
                 }
 
                 ("filter",
@@ -100,33 +97,26 @@ impl Application {
                     Ok(Application::DirectFilterPiped(*comp, value.clone()))
                 }
                 ("filter",
-                 [Expression::Symbol(tag), Expression::String(test)]) => {
-                    Ok(Application::ScriptedFilter(tag.clone(), test.clone(), None))
-                }
-                ("filter",
-                 [Expression::Symbol(tag_or_name), Expression::String(test), Expression::String(setup)]) => {
+                 [Expression::Symbol(tag_or_name), Expression::String(test)]) => {
                     if is_pipelined {
-                        Ok(Application::ScriptedFilterPipedNamed(tag_or_name.clone(), test.clone(), Some(setup.clone())))
+                        Ok(Application::ScriptedFilterPipedNamed(tag_or_name.clone(), test.clone()))
                     } else {
-                        Ok(Application::ScriptedFilter(tag_or_name.clone(), test.clone(), Some(setup.clone())))
+                        Ok(Application::ScriptedFilter(tag_or_name.clone(), test.clone()))
                     }
                 }
                 ("filter",
-                 [Expression::Symbol(tag), Expression::Symbol(name), Expression::String(test), Expression::String(setup)]) => {
-                    Ok(Application::ScriptedFilterNamed(tag.clone(), name.clone(), test.clone(), Some(setup.clone())))
+                 [Expression::Symbol(tag), Expression::Symbol(name), Expression::String(test)]) => {
+                    Ok(Application::ScriptedFilterNamed(tag.clone(), name.clone(), test.clone()))
                 }
                 ("filter", [Expression::String(test)]) => {
-                    Ok(Application::ScriptedFilterPiped(test.clone(), None))
-                }
-                ("filter", [Expression::String(test), Expression::String(setup)]) => {
-                    Ok(Application::ScriptedFilterPiped(test.clone(), Some(setup.clone())))
+                    Ok(Application::ScriptedFilterPiped(test.clone()))
                 }
 
                 ("take", [Expression::Symbol(log), Expression::Int(count)]) => {
                     Ok(Application::Take(log.clone(), *count))
                 }
                 ("take", [Expression::Int(count)]) => {
-                    Ok(Application::TakePipe(*count))
+                    Ok(Application::TakePiped(*count))
                 }
 
                 _ => Err(SyntaxError::UnknownFunction),
@@ -139,23 +129,24 @@ impl Application {
     fn is_pipelined(&self) -> bool {
         match self {
             Application::Load(_, _) => false,
+            Application::Script(_) => false,
             Application::Tag(_, _) => false,
             Application::Regex(_, _) => false,
-            Application::Transform(_, _, _) => false,
+            Application::Transform(_, _) => false,
             Application::DirectFilter(_, _, _) => false,
             Application::DirectFilterNamed(_, _, _, _) => false,
-            Application::ScriptedFilter(_, _, _) => false,
-            Application::ScriptedFilterNamed(_, _, _, _) => false,
+            Application::ScriptedFilter(_, _) => false,
+            Application::ScriptedFilterNamed(_, _, _) => false,
             Application::Take(_, _) => false,
 
             Application::TagPiped(_) => true,
             Application::RegexPiped(_) => true,
-            Application::TransformPiped(_, _) => true,
+            Application::TransformPiped(_) => true,
             Application::DirectFilterPiped(_, _) => true,
             Application::DirectFilterPipedNamed(_, _, _) => true,
-            Application::ScriptedFilterPiped(_, _) => true,
-            Application::ScriptedFilterPipedNamed(_, _, _) => true,
-            Application::TakePipe(_) => true,
+            Application::ScriptedFilterPiped(_) => true,
+            Application::ScriptedFilterPipedNamed(_, _) => true,
+            Application::TakePiped(_) => true,
         }
     }
 }
@@ -248,7 +239,7 @@ impl Interpreter {
 
         for app in applications {
             let output = self.apply(&mut engine, app, target)?;
-            target = Some(output.id);
+            target = output.id;
             lines = output.lines;
         }
         Ok(lines)
@@ -263,14 +254,19 @@ impl Interpreter {
         match app {
             Application::Load(name, path_str) => {
                 let output = engine.run_command(&Command::Load(PathBuf::from(path_str)))?;
-                *self.symbols.entry(name).or_insert(output.id) = output.id;
+                let output_id = output.id.unwrap();
+                *self.symbols.entry(name).or_insert(output_id) = output_id;
                 Ok(output)
+            }
+            Application::Script(script) => {
+                engine.run_command(&Command::Script(script))
             }
 
             Application::Tag(file_name, tag_name) => {
                 if let Some(Id::File(file_id)) = self.symbols.get(&file_name) {
                     let output = engine.run_command(&Command::Tag(*file_id, tag_name.clone()))?;
-                    *self.symbols.entry(tag_name).or_insert(output.id) = output.id;
+                    let output_id = output.id.unwrap();
+                    *self.symbols.entry(tag_name).or_insert(output_id) = output_id;
                     Ok(output)
                 } else {
                     Err(Error::FileNotLoaded(file_name))
@@ -280,7 +276,8 @@ impl Interpreter {
                 if let Some(Id::File(file_id)) = target {
                     let output =
                         engine.run_command(&Command::Tag(file_id, tag_name.to_string()))?;
-                    *self.symbols.entry(tag_name).or_insert(output.id) = output.id;
+                    let output_id = output.id.unwrap();
+                    *self.symbols.entry(tag_name).or_insert(output_id) = output_id;
                     Ok(output)
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
@@ -302,16 +299,16 @@ impl Interpreter {
                 }
             }
 
-            Application::Transform(tag_name, transform, setup) => {
+            Application::Transform(tag_name, transform) => {
                 if let Some(Id::Tag(tag_id)) = self.symbols.get(&tag_name) {
-                    engine.run_command(&Command::Transform(*tag_id, transform, setup))
+                    engine.run_command(&Command::Transform(*tag_id, transform))
                 } else {
                     Err(Error::SymbolNotFound(tag_name))
                 }
             }
-            Application::TransformPiped(transform, setup) => {
+            Application::TransformPiped(transform) => {
                 if let Some(Id::Tag(tag_id)) = target {
-                    engine.run_command(&Command::Transform(tag_id, transform, setup))
+                    engine.run_command(&Command::Transform(tag_id, transform))
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
                 }
@@ -328,7 +325,8 @@ impl Interpreter {
                 if let Some(id) = self.symbols.get(&tag_name) {
                     let output =
                         engine.run_command(&Command::DirectFilter(*id, comparator, value))?;
-                    *self.symbols.entry(filter_name).or_insert(output.id) = output.id;
+                    let output_id = output.id.unwrap();
+                    *self.symbols.entry(filter_name).or_insert(output_id) = output_id;
                     Ok(output)
                 } else {
                     Err(Error::SymbolNotFound(tag_name))
@@ -345,42 +343,45 @@ impl Interpreter {
                 if let Some(id) = target {
                     let output =
                         engine.run_command(&Command::DirectFilter(id, comparator, value))?;
-                    *self.symbols.entry(filter_name).or_insert(output.id) = output.id;
+                    let output_id = output.id.unwrap();
+                    *self.symbols.entry(filter_name).or_insert(output_id) = output_id;
                     Ok(output)
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
                 }
             }
 
-            Application::ScriptedFilter(tag_name, test, setup) => {
+            Application::ScriptedFilter(tag_name, test) => {
                 if let Some(id) = self.symbols.get(&tag_name) {
-                    engine.run_command(&Command::ScriptedFilter(*id, test, setup))
+                    engine.run_command(&Command::ScriptedFilter(*id, test))
                 } else {
                     Err(Error::SymbolNotFound(tag_name))
                 }
             }
-            Application::ScriptedFilterNamed(tag_name, filter_name, test, setup) => {
+            Application::ScriptedFilterNamed(tag_name, filter_name, test) => {
                 if let Some(id) = self.symbols.get(&tag_name) {
                     let output =
-                        engine.run_command(&Command::ScriptedFilter(*id, test, setup))?;
-                    *self.symbols.entry(filter_name).or_insert(output.id) = output.id;
+                        engine.run_command(&Command::ScriptedFilter(*id, test))?;
+                    let output_id = output.id.unwrap();
+                    *self.symbols.entry(filter_name).or_insert(output_id) = output_id;
                     Ok(output)
                 } else {
                     Err(Error::SymbolNotFound(tag_name))
                 }
             }
-            Application::ScriptedFilterPiped(test, setup) => {
+            Application::ScriptedFilterPiped(test) => {
                 if let Some(id) = target {
-                    engine.run_command(&Command::ScriptedFilter(id, test, setup))
+                    engine.run_command(&Command::ScriptedFilter(id, test))
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
                 }
             }
-            Application::ScriptedFilterPipedNamed(filter_name, test, setup) => {
+            Application::ScriptedFilterPipedNamed(filter_name, test) => {
                 if let Some(id) = target {
                     let output =
-                        engine.run_command(&Command::ScriptedFilter(id, test, setup))?;
-                    *self.symbols.entry(filter_name).or_insert(output.id) = output.id;
+                        engine.run_command(&Command::ScriptedFilter(id, test))?;
+                    let output_id = output.id.unwrap();
+                    *self.symbols.entry(filter_name).or_insert(output_id) = output_id;
                     Ok(output)
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
@@ -394,7 +395,7 @@ impl Interpreter {
                     Err(Error::SymbolNotFound(name))
                 }
             }
-            Application::TakePipe(count) => {
+            Application::TakePiped(count) => {
                 if let Some(id) = target {
                     engine.run_command(&Command::Take(id, count))
                 } else {

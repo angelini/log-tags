@@ -13,40 +13,24 @@ use crate::error::{Error, Result};
 #[derive(Debug)]
 pub enum Command {
     Load(path::PathBuf),
+    Script(String),
 
     Tag(FileId, String),
     Regex(TagId, String),
-    Transform(TagId, String, Option<String>),
+    Transform(TagId, String),
 
     DirectFilter(Id, Comparator, String),
-    ScriptedFilter(Id, String, Option<String>),
+    ScriptedFilter(Id, String),
 
-    // TODO
-    Distinct(TagId, usize),
-    DistinctCounts(TagId, usize),
+    Distinct(TagId),
 
     Take(Id, usize),
-}
-
-#[derive(Clone, Debug, Default)]
-struct LuaScript {
-    setup: Option<String>,
-    eval: Option<String>,
-}
-
-impl LuaScript {
-    fn new<S: Into<String>>(eval: S, setup: Option<S>) -> LuaScript {
-        LuaScript {
-            setup: setup.map(|s| s.into()),
-            eval: Some(eval.into()),
-        }
-    }
 }
 
 struct Tag {
     name: String,
     regex: Option<Regex>,
-    transform: LuaScript,
+    transform: Option<String>,
 }
 
 impl Tag {
@@ -54,7 +38,7 @@ impl Tag {
         Tag {
             name: name.into(),
             regex: None,
-            transform: LuaScript::default(),
+            transform: None,
         }
     }
 
@@ -63,14 +47,14 @@ impl Tag {
         Ok(())
     }
 
-    fn with_script(&mut self, script: LuaScript) {
-        self.transform = script;
+    fn with_transform(&mut self, transform: String) {
+        self.transform = Some(transform);
     }
 }
 
 enum Filter {
     Direct(Comparator, String),
-    Scripted(LuaScript),
+    Scripted(String),
 }
 
 #[derive(Default)]
@@ -119,13 +103,17 @@ impl Bounded for FilterCache {
 }
 
 pub struct Output {
-    pub id: Id,
+    pub id: Option<Id>,
     pub lines: Vec<String>,
 }
 
 impl Output {
     fn new(id: Id, lines: Vec<String>) -> Output {
-        Output { id, lines }
+        Output { id: Some(id), lines }
+    }
+
+    fn without_id(lines: Vec<String>) -> Output {
+        Output { id: None, lines }
     }
 }
 
@@ -194,7 +182,7 @@ pub struct Engine {
 
     tags: HashMap<TagId, Tag>,
     tag_caches: HashMap<TagId, TagCache>,
-    file_to_tags: HashMap<FileId, Vec<TagId>>,
+    tag_to_file: HashMap<TagId, FileId>,
 
     filters: HashMap<FilterId, Filter>,
     filter_caches: HashMap<FilterId, FilterCache>,
@@ -212,7 +200,7 @@ impl Engine {
 
             tags: HashMap::new(),
             tag_caches: HashMap::new(),
-            file_to_tags: HashMap::new(),
+            tag_to_file: HashMap::new(),
 
             filters: HashMap::new(),
             filter_caches: HashMap::new(),
@@ -230,14 +218,15 @@ impl Engine {
                     vec![format!("loaded {:?}", path)],
                 ))
             }
+            Command::Script(script) => {
+                self.run_script(script)?;
+                Ok(Output::without_id(vec![format!("script loaded")]))
+            }
 
             Command::Tag(file_id, tag_name) => {
                 let tag_id = self.next_tag_id();
                 self.tags.insert(tag_id, Tag::new(tag_name));
-
-                let tags = self.file_to_tags.entry(*file_id).or_insert_with(|| vec![]);
-                tags.push(tag_id);
-
+                self.tag_to_file.insert(tag_id, *file_id);
                 Ok(Output::new(Id::Tag(tag_id), vec![]))
             }
             Command::Regex(tag_id, regex) => {
@@ -248,43 +237,36 @@ impl Engine {
                 tag.with_regex(regex)?;
                 Ok(Output::new(Id::Tag(*tag_id), vec![]))
             }
-            Command::Transform(tag_id, transform, setup) => {
-                let script = LuaScript::new(transform, setup.as_ref());
-                self.run_setup(&script)?;
-
+            Command::Transform(tag_id, transform) => {
                 let tag = self
                     .tags
                     .get_mut(tag_id)
                     .ok_or_else(|| Error::MissingId(Id::Tag(*tag_id)))?;
-                tag.with_script(script);
+                tag.with_transform(transform.clone());
 
                 Ok(Output::new(Id::Tag(*tag_id), vec![]))
             }
 
             Command::DirectFilter(id, comparator, value) => {
                 let filter_id = self.next_filter_id();
-
                 let filter = Filter::Direct(*comparator, value.clone());
+
                 self.filters.insert(filter_id, filter);
                 self.filter_to_parent.insert(filter_id, *id);
 
                 Ok(Output::new(Id::Filter(filter_id), vec![]))
             }
-            Command::ScriptedFilter(id, test, setup) => {
+            Command::ScriptedFilter(id, test) => {
                 let filter_id = self.next_filter_id();
+                let filter = Filter::Scripted(test.clone());
 
-                let script = LuaScript::new(test, setup.as_ref());
-                self.run_setup(&script)?;
-
-                let filter = Filter::Scripted(script);
                 self.filters.insert(filter_id, filter);
                 self.filter_to_parent.insert(filter_id, *id);
 
                 Ok(Output::new(Id::Filter(filter_id), vec![]))
             }
 
-            Command::Distinct(tag_id, max) => Ok(Output::new(Id::Tag(*tag_id), vec![])),
-            Command::DistinctCounts(tag_id, max) => Ok(Output::new(Id::Tag(*tag_id), vec![])),
+            Command::Distinct(tag_id) => Ok(Output::new(Id::Tag(*tag_id), vec![])),
 
             Command::Take(id, count) => Ok(Output::new(*id, self.take(&self.plan(*id), *count)?)),
         }
@@ -313,7 +295,7 @@ impl Engine {
         match id {
             Id::File(_) => vec![id],
             Id::Tag(tag_id) => {
-                let mut parent = self.plan_steps(Id::File(self.tag_to_file(tag_id).unwrap()));
+                let mut parent = self.plan_steps(Id::File(self.tag_to_file[&tag_id]));
                 parent.push(id);
                 parent
             }
@@ -339,10 +321,14 @@ impl Engine {
                         interval.1 += read_count;
                     }
                     Id::Tag(tag_id) => {
-                        self.ensure_tag(self.tag_to_file(*tag_id).unwrap(), *tag_id, interval)?;
+                        self.ensure_tag(self.tag_to_file[tag_id], *tag_id, interval)?;
                     }
                     Id::Filter(filter_id) => {
-                        self.ensure_filter(self.filter_to_tag(*filter_id).unwrap(), *filter_id, interval)?;
+                        self.ensure_filter(
+                            self.filter_to_tag(*filter_id).unwrap(),
+                            *filter_id,
+                            interval,
+                        )?;
                     }
                 }
             }
@@ -406,11 +392,9 @@ impl Engine {
         Ok(output)
     }
 
-    fn run_setup(&mut self, script: &LuaScript) -> Result<()> {
+    fn run_script(&mut self, script: &str) -> Result<()> {
         self.lua.context(|lua_ctx| {
-            if let Some(ref setup) = script.setup {
-                lua_ctx.load(setup).eval()?;
-            }
+            lua_ctx.load(script).eval()?;
             Ok(())
         })
     }
@@ -459,7 +443,7 @@ impl Engine {
     }
 
     fn read_lines(&self, file_id: FileId, interval: Interval) -> &[String] {
-        &self.file_caches.get(&file_id).unwrap().loaded[interval.0..interval.1]
+        &self.file_caches[&file_id].loaded[interval.0..interval.1]
     }
 
     fn ensure_tag(&mut self, file_id: FileId, tag_id: TagId, interval: Interval) -> Result<()> {
@@ -512,29 +496,22 @@ impl Engine {
     }
 
     fn ensure_all_tags(&mut self, file_id: FileId, interval: Interval) -> Result<()> {
-        if let Some(tag_ids) = self.file_to_tags.get(&file_id) {
-            for tag_id in tag_ids.clone() {
-                self.ensure_tag(file_id, tag_id, interval)?;
-            }
+        for tag_id in self.file_to_tags(file_id) {
+            self.ensure_tag(file_id, tag_id, interval)?;
         }
         Ok(())
     }
 
     fn read_tag(&self, tag_id: TagId, interval: Interval) -> &[TagValue] {
-        &self.tag_caches.get(&tag_id).unwrap().loaded[interval.0..interval.1]
+        &self.tag_caches[&tag_id].loaded[interval.0..interval.1]
     }
 
     fn read_all_tags(&self, file_id: FileId, interval: Interval) -> Vec<(String, &[TagValue])> {
         let tags_name_and_id = self
-            .file_to_tags
-            .get(&file_id)
-            .map(|tag_ids| {
-                tag_ids
-                    .iter()
-                    .map(|tag_id| (self.tags.get(tag_id).unwrap().name.clone(), *tag_id))
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![]);
+            .file_to_tags(file_id)
+            .into_iter()
+            .map(|tag_id| (self.tags[&tag_id].name.clone(), tag_id))
+            .collect::<Vec<(String, TagId)>>();
 
         let mut result = Vec::with_capacity(tags_name_and_id.len());
         for (name, tag_id) in tags_name_and_id {
@@ -609,21 +586,22 @@ impl Engine {
     }
 
     fn read_filter(&self, filter_id: FilterId) -> &BitSet {
-        &self.filter_caches.get(&filter_id).unwrap().loaded
+        &self.filter_caches[&filter_id].loaded
     }
 
     fn parse_tag_from_lines(lua: &rlua::Lua, tag: &Tag, lines: &[String]) -> Vec<TagValue> {
+        let transform = tag.transform.as_ref().map(|s| s.as_str());
         lines
             .iter()
             .map(|line| {
                 if let Some(ref regex) = tag.regex {
                     regex.captures(line).and_then(|captures| {
                         captures.get(1).and_then(|m| {
-                            Engine::transform_chunk(&lua, &tag.transform, m.as_str()).ok()
+                            Engine::transform_chunk(&lua, transform, m.as_str()).ok()
                         })
                     })
                 } else {
-                    Engine::transform_chunk(&lua, &tag.transform, line).ok()
+                    Engine::transform_chunk(&lua, transform, line).ok()
                 }
             })
             .collect()
@@ -640,15 +618,21 @@ impl Engine {
                 let mut result = BitSet::new();
                 for (idx, left_option) in values.iter().enumerate() {
                     match (comp, left_option) {
-                        (Comparator::Equal, Some(left)) if left == right => result.insert(start + idx),
-                        (Comparator::NotEqual, Some(left)) if left != right => result.insert(start + idx),
+                        (Comparator::Equal, Some(left)) if left == right => {
+                            result.insert(start + idx)
+                        }
+                        (Comparator::NotEqual, Some(left)) if left != right => {
+                            result.insert(start + idx)
+                        }
                         (Comparator::GreaterThan, Some(left)) if left > right => {
                             result.insert(start + idx)
                         }
                         (Comparator::GreaterThanEqual, Some(left)) if left >= right => {
                             result.insert(start + idx)
                         }
-                        (Comparator::LessThan, Some(left)) if left < right => result.insert(start + idx),
+                        (Comparator::LessThan, Some(left)) if left < right => {
+                            result.insert(start + idx)
+                        }
                         (Comparator::LessThanEqual, Some(left)) if left <= right => {
                             result.insert(start + idx)
                         }
@@ -662,9 +646,9 @@ impl Engine {
         }
     }
 
-    fn transform_chunk(lua: &rlua::Lua, transform: &LuaScript, chunk: &str) -> Result<String> {
-        match transform.eval {
-            Some(ref eval_src) => Ok(lua.context(|lua_ctx| {
+    fn transform_chunk(lua: &rlua::Lua, transform: Option<&str>, chunk: &str) -> Result<String> {
+        match transform {
+            Some(eval_src) => Ok(lua.context(|lua_ctx| {
                 lua_ctx.globals().set("chunk", chunk)?;
                 lua_ctx.load(eval_src).eval()
             })?),
@@ -672,20 +656,19 @@ impl Engine {
         }
     }
 
-    fn tag_to_file(&self, tag_id: TagId) -> Option<FileId> {
-        for (file_id, tag_ids) in &self.file_to_tags {
-            if tag_ids.contains(&tag_id) {
-                return Some(*file_id);
-            }
-        }
-        None
+    fn file_to_tags(&self, file_id: FileId) -> Vec<TagId> {
+        self.tag_to_file
+            .iter()
+            .filter(|(_, &fid)| fid == file_id)
+            .map(|(tid, _)| *tid)
+            .collect()
     }
 
     fn filter_to_tag(&self, filter_id: FilterId) -> Option<TagId> {
         match self.filter_to_parent[&filter_id] {
-            Id::File(fid) => None,
+            Id::File(_) => None,
             Id::Filter(fid) => self.filter_to_tag(fid),
-            Id::Tag(tid) => Some(tid)
+            Id::Tag(tid) => Some(tid),
         }
     }
 }
