@@ -34,3 +34,6 @@ end
 | regex("\[(\S+ \S+ \d+ \d+:\d+:\d+ \d+)\]")
 | transform("parse_date(chunk)")
 | take(5)
+
+> distinct('date)
+| take(5)

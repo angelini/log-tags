@@ -32,6 +32,9 @@ pub enum Application {
     ScriptedFilterPiped(String),
     ScriptedFilterPipedNamed(String, String),
 
+    Distinct(String),
+    DistinctPiped,
+
     Take(String, usize),
     TakePiped(usize),
 }
@@ -81,35 +84,44 @@ impl Application {
                 }
 
                 ("filter",
-                 [Expression::Symbol(tag_or_name), Expression::Comparator(comp), Expression::String(value)]) => {
+                 [Expression::Symbol(parent_or_name), Expression::Comparator(comp), Expression::String(value)]) => {
                     if is_pipelined {
-                        Ok(Application::DirectFilterPipedNamed(tag_or_name.clone(), *comp, value.clone()))
+                        Ok(Application::DirectFilterPipedNamed(parent_or_name.clone(), *comp, value.clone()))
                     } else {
-                        Ok(Application::DirectFilter(tag_or_name.clone(), *comp, value.clone()))
+                        Ok(Application::DirectFilter(parent_or_name.clone(), *comp, value.clone()))
                     }
                 }
                 ("filter",
-                 [Expression::Symbol(tag), Expression::Symbol(name), Expression::Comparator(comp), Expression::String(value)]) => {
-                    Ok(Application::DirectFilterNamed(tag.clone(), name.clone(), *comp, value.clone()))
+                 [Expression::Symbol(parent), Expression::Symbol(name), Expression::Comparator(comp), Expression::String(value)]) => {
+                    Ok(Application::DirectFilterNamed(parent.clone(), name.clone(), *comp, value.clone()))
                 }
                 ("filter",
                  [Expression::Comparator(comp), Expression::String(value)]) => {
                     Ok(Application::DirectFilterPiped(*comp, value.clone()))
                 }
                 ("filter",
-                 [Expression::Symbol(tag_or_name), Expression::String(test)]) => {
+                 [Expression::Symbol(parent_or_name), Expression::String(test)]) => {
                     if is_pipelined {
-                        Ok(Application::ScriptedFilterPipedNamed(tag_or_name.clone(), test.clone()))
+                        Ok(Application::ScriptedFilterPipedNamed(parent_or_name.clone(), test.clone()))
                     } else {
-                        Ok(Application::ScriptedFilter(tag_or_name.clone(), test.clone()))
+                        Ok(Application::ScriptedFilter(parent_or_name.clone(), test.clone()))
                     }
                 }
                 ("filter",
-                 [Expression::Symbol(tag), Expression::Symbol(name), Expression::String(test)]) => {
-                    Ok(Application::ScriptedFilterNamed(tag.clone(), name.clone(), test.clone()))
+                 [Expression::Symbol(parent), Expression::Symbol(name), Expression::String(test)]) => {
+                    Ok(Application::ScriptedFilterNamed(parent.clone(), name.clone(), test.clone()))
                 }
                 ("filter", [Expression::String(test)]) => {
                     Ok(Application::ScriptedFilterPiped(test.clone()))
+                }
+
+                ("distinct",
+                 [Expression::Symbol(parent)]) => {
+                    Ok(Application::Distinct(parent.clone()))
+                }
+                ("distinct",
+                 []) => {
+                    Ok(Application::DistinctPiped)
                 }
 
                 ("take", [Expression::Symbol(log), Expression::Int(count)]) => {
@@ -137,6 +149,7 @@ impl Application {
             Application::DirectFilterNamed(_, _, _, _) => false,
             Application::ScriptedFilter(_, _) => false,
             Application::ScriptedFilterNamed(_, _, _) => false,
+            Application::Distinct(_) => false,
             Application::Take(_, _) => false,
 
             Application::TagPiped(_) => true,
@@ -146,6 +159,7 @@ impl Application {
             Application::DirectFilterPipedNamed(_, _, _) => true,
             Application::ScriptedFilterPiped(_) => true,
             Application::ScriptedFilterPipedNamed(_, _) => true,
+            Application::DistinctPiped => true,
             Application::TakePiped(_) => true,
         }
     }
@@ -252,21 +266,17 @@ impl Interpreter {
         target: Option<Id>,
     ) -> Result<Output> {
         match app {
-            Application::Load(name, path_str) => {
+            Application::Load(file_name, path_str) => {
                 let output = engine.run_command(&Command::Load(PathBuf::from(path_str)))?;
-                let output_id = output.id.unwrap();
-                *self.symbols.entry(name).or_insert(output_id) = output_id;
+                self.add_symbol(file_name, output.id)?;
                 Ok(output)
             }
-            Application::Script(script) => {
-                engine.run_command(&Command::Script(script))
-            }
+            Application::Script(script) => engine.run_command(&Command::Script(script)),
 
             Application::Tag(file_name, tag_name) => {
                 if let Some(Id::File(file_id)) = self.symbols.get(&file_name) {
                     let output = engine.run_command(&Command::Tag(*file_id, tag_name.clone()))?;
-                    let output_id = output.id.unwrap();
-                    *self.symbols.entry(tag_name).or_insert(output_id) = output_id;
+                    self.add_symbol(tag_name, output.id)?;
                     Ok(output)
                 } else {
                     Err(Error::FileNotLoaded(file_name))
@@ -276,8 +286,7 @@ impl Interpreter {
                 if let Some(Id::File(file_id)) = target {
                     let output =
                         engine.run_command(&Command::Tag(file_id, tag_name.to_string()))?;
-                    let output_id = output.id.unwrap();
-                    *self.symbols.entry(tag_name).or_insert(output_id) = output_id;
+                    self.add_symbol(tag_name, output.id)?;
                     Ok(output)
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
@@ -314,22 +323,21 @@ impl Interpreter {
                 }
             }
 
-            Application::DirectFilter(tag_name, comparator, value) => {
-                if let Some(id) = self.symbols.get(&tag_name) {
+            Application::DirectFilter(parent_name, comparator, value) => {
+                if let Some(id) = self.symbols.get(&parent_name) {
                     engine.run_command(&Command::DirectFilter(*id, comparator, value))
                 } else {
-                    Err(Error::SymbolNotFound(tag_name))
+                    Err(Error::SymbolNotFound(parent_name))
                 }
             }
-            Application::DirectFilterNamed(tag_name, filter_name, comparator, value) => {
-                if let Some(id) = self.symbols.get(&tag_name) {
+            Application::DirectFilterNamed(parent_name, filter_name, comparator, value) => {
+                if let Some(id) = self.symbols.get(&parent_name) {
                     let output =
                         engine.run_command(&Command::DirectFilter(*id, comparator, value))?;
-                    let output_id = output.id.unwrap();
-                    *self.symbols.entry(filter_name).or_insert(output_id) = output_id;
+                    self.add_symbol(filter_name, output.id)?;
                     Ok(output)
                 } else {
-                    Err(Error::SymbolNotFound(tag_name))
+                    Err(Error::SymbolNotFound(parent_name))
                 }
             }
             Application::DirectFilterPiped(comparator, value) => {
@@ -343,30 +351,27 @@ impl Interpreter {
                 if let Some(id) = target {
                     let output =
                         engine.run_command(&Command::DirectFilter(id, comparator, value))?;
-                    let output_id = output.id.unwrap();
-                    *self.symbols.entry(filter_name).or_insert(output_id) = output_id;
+                    self.add_symbol(filter_name, output.id)?;
                     Ok(output)
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
                 }
             }
 
-            Application::ScriptedFilter(tag_name, test) => {
-                if let Some(id) = self.symbols.get(&tag_name) {
+            Application::ScriptedFilter(parent_name, test) => {
+                if let Some(id) = self.symbols.get(&parent_name) {
                     engine.run_command(&Command::ScriptedFilter(*id, test))
                 } else {
-                    Err(Error::SymbolNotFound(tag_name))
+                    Err(Error::SymbolNotFound(parent_name))
                 }
             }
-            Application::ScriptedFilterNamed(tag_name, filter_name, test) => {
-                if let Some(id) = self.symbols.get(&tag_name) {
-                    let output =
-                        engine.run_command(&Command::ScriptedFilter(*id, test))?;
-                    let output_id = output.id.unwrap();
-                    *self.symbols.entry(filter_name).or_insert(output_id) = output_id;
+            Application::ScriptedFilterNamed(parent_name, filter_name, test) => {
+                if let Some(id) = self.symbols.get(&parent_name) {
+                    let output = engine.run_command(&Command::ScriptedFilter(*id, test))?;
+                    self.add_symbol(filter_name, output.id)?;
                     Ok(output)
                 } else {
-                    Err(Error::SymbolNotFound(tag_name))
+                    Err(Error::SymbolNotFound(parent_name))
                 }
             }
             Application::ScriptedFilterPiped(test) => {
@@ -378,14 +383,28 @@ impl Interpreter {
             }
             Application::ScriptedFilterPipedNamed(filter_name, test) => {
                 if let Some(id) = target {
-                    let output =
-                        engine.run_command(&Command::ScriptedFilter(id, test))?;
-                    let output_id = output.id.unwrap();
-                    *self.symbols.entry(filter_name).or_insert(output_id) = output_id;
+                    let output = engine.run_command(&Command::ScriptedFilter(id, test))?;
+                    self.add_symbol(filter_name, output.id)?;
                     Ok(output)
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
                 }
+            }
+
+            Application::Distinct(parent_name) => {
+                if let Some(id) = self.symbols.get(&parent_name) {
+                    engine.run_command(&Command::Distinct(*id))
+                } else {
+                    Err(Error::SymbolNotFound(parent_name))
+                }
+            }
+            Application::DistinctPiped => {
+                if let Some(id) = target {
+                    engine.run_command(&Command::Distinct(id))
+                } else {
+                    Err(Error::InvalidTarget(format!("{:?}", target)))
+                }
+
             }
 
             Application::Take(name, count) => {
@@ -403,5 +422,13 @@ impl Interpreter {
                 }
             }
         }
+    }
+
+    fn add_symbol(&mut self, name: String, id_option: Option<Id>) -> Result<()> {
+        id_option
+            .map(|id| {
+                *self.symbols.entry(name).or_insert(id) = id;
+            })
+            .ok_or_else(|| Error::OutputWithoutId)
     }
 }
