@@ -626,7 +626,7 @@ impl Engine {
                 filter,
                 tag_values,
                 missing_before.0,
-            ))
+            )?)
         }
 
         let missing_after = cache_bounds.missing_after(interval);
@@ -637,7 +637,7 @@ impl Engine {
                 filter,
                 tag_values,
                 missing_after.0,
-            ))
+            )?)
         }
 
         let cache = self
@@ -756,7 +756,7 @@ impl Engine {
         filter: &Filter,
         values: &[TagValue],
         start: usize,
-    ) -> BitSet {
+    ) -> Result<BitSet> {
         match filter {
             Filter::Direct(comp, right) => {
                 let mut result = BitSet::new();
@@ -784,9 +784,19 @@ impl Engine {
                         (_, Some(_)) => continue,
                     };
                 }
-                result
+                Ok(result)
             }
-            Filter::Scripted(script) => unimplemented!(),
+            Filter::Scripted(script) => {
+                let mut result = BitSet::new();
+                for (idx, value_option) in values.iter().enumerate() {
+                    if let Some(value) = value_option {
+                        if Self::test_chunk(lua, script, value)? {
+                            result.insert(start + idx);
+                        }
+                    }
+                }
+                Ok(result)
+            }
         }
     }
 
@@ -812,6 +822,13 @@ impl Engine {
             })?),
             None => Ok(chunk.to_string()),
         }
+    }
+
+    fn test_chunk(lua: &rlua::Lua, test: &str, chunk: &str) -> Result<bool> {
+        Ok(lua.context(|lua_ctx| {
+            lua_ctx.globals().set("chunk", chunk)?;
+            lua_ctx.load(test).eval()
+        })?)
     }
 
     fn file_to_tags(&self, file_id: FileId) -> Vec<TagId> {

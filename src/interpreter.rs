@@ -404,7 +404,6 @@ impl Interpreter {
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
                 }
-
             }
 
             Application::Take(name, count) => {

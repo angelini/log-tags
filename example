@@ -22,6 +22,15 @@
 | take(5)
 
 > script("
+function is_four (d)
+  return d == '03'
+end
+")
+
+> filter('hour, "is_four(chunk)")
+| take(5)
+
+> script("
 months = {}
 months['Dec'] = 12
 
