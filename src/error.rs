@@ -18,6 +18,7 @@ pub enum Error {
     FileNotLoaded(String),
     InvalidTarget(String),
     MissingId(Id),
+    OutputWithoutId,
     Parser(String),
     SymbolNotFound(String),
     Syntax(SyntaxError, String),
@@ -58,6 +59,7 @@ impl fmt::Display for Error {
             Error::FileNotLoaded(ref path) => write!(f, "File not loaded: {}", path),
             Error::InvalidTarget(ref target) => write!(f, "Invalid target: {}", target),
             Error::MissingId(ref id) => write!(f, "Missing ID: {:?}", id),
+            Error::OutputWithoutId => write!(f, "Output without ID"),
             Error::Parser(ref err) => write!(f, "Parser error:\n{}", err),
             Error::SymbolNotFound(ref symbol) => write!(f, "Symbol not found: {}", symbol),
             Error::Syntax(ref kind, ref message) => {

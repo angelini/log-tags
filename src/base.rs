@@ -1,4 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DistinctId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileId(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -9,6 +12,7 @@ pub struct TagId(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Id {
+    Distinct(DistinctId),
     File(FileId),
     Filter(FilterId),
     Tag(TagId),

@@ -5,9 +5,10 @@ use std::io::prelude::*;
 use std::path;
 
 use bit_set::BitSet;
+use ethbloom::{self, Bloom};
 use regex::Regex;
 
-use crate::base::{Bounded, Comparator, FileId, FilterId, Id, Interval, TagId};
+use crate::base::{Bounded, Comparator, DistinctId, FileId, FilterId, Id, Interval, TagId};
 use crate::error::{Error, Result};
 
 #[derive(Debug)]
@@ -22,7 +23,7 @@ pub enum Command {
     DirectFilter(Id, Comparator, String),
     ScriptedFilter(Id, String),
 
-    Distinct(TagId),
+    Distinct(Id),
 
     Take(Id, usize),
 }
@@ -102,6 +103,26 @@ impl Bounded for FilterCache {
     }
 }
 
+#[derive(Default)]
+struct DistinctCache {
+    start: usize,
+    end: usize,
+    loaded: BitSet,
+    bloom: Bloom,
+}
+
+impl DistinctCache {
+    fn count(&self) -> usize {
+        self.loaded.iter().count()
+    }
+}
+
+impl Bounded for DistinctCache {
+    fn bounds(&self) -> Interval {
+        Interval(self.start, self.end)
+    }
+}
+
 pub struct Output {
     pub id: Option<Id>,
     pub lines: Vec<String>,
@@ -109,7 +130,10 @@ pub struct Output {
 
 impl Output {
     fn new(id: Id, lines: Vec<String>) -> Output {
-        Output { id: Some(id), lines }
+        Output {
+            id: Some(id),
+            lines,
+        }
     }
 
     fn without_id(lines: Vec<String>) -> Output {
@@ -128,7 +152,7 @@ impl ReadIntervals {
         ReadIntervals {
             index: 0,
             next: std::cmp::min(min, max),
-            max: max,
+            max,
         }
     }
 }
@@ -146,6 +170,7 @@ impl Iterator for ReadIntervals {
 
 const MAX_BATCH_SIZE: usize = 1024;
 
+#[derive(Debug)]
 struct Plan {
     steps: Vec<Id>,
 }
@@ -171,6 +196,16 @@ impl Plan {
             })
             .collect()
     }
+
+    fn distinct_ids(&self) -> Vec<DistinctId> {
+        self.steps
+            .iter()
+            .filter_map(|step| match step {
+                Id::Distinct(distinct_id) => Some(*distinct_id),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 pub struct Engine {
@@ -187,6 +222,9 @@ pub struct Engine {
     filters: HashMap<FilterId, Filter>,
     filter_caches: HashMap<FilterId, FilterCache>,
     filter_to_parent: HashMap<FilterId, Id>,
+
+    distinct_caches: HashMap<DistinctId, DistinctCache>,
+    distinct_to_parent: HashMap<DistinctId, Id>,
 }
 
 impl Engine {
@@ -205,6 +243,9 @@ impl Engine {
             filters: HashMap::new(),
             filter_caches: HashMap::new(),
             filter_to_parent: HashMap::new(),
+
+            distinct_caches: HashMap::new(),
+            distinct_to_parent: HashMap::new(),
         }
     }
 
@@ -220,7 +261,7 @@ impl Engine {
             }
             Command::Script(script) => {
                 self.run_script(script)?;
-                Ok(Output::without_id(vec![format!("script loaded")]))
+                Ok(Output::without_id(vec!["script loaded".to_string()]))
             }
 
             Command::Tag(file_id, tag_name) => {
@@ -266,10 +307,19 @@ impl Engine {
                 Ok(Output::new(Id::Filter(filter_id), vec![]))
             }
 
-            Command::Distinct(tag_id) => Ok(Output::new(Id::Tag(*tag_id), vec![])),
+            Command::Distinct(id) => {
+                let distinct_id = self.next_distinct_id();
+                self.distinct_to_parent.insert(distinct_id, *id);
+                Ok(Output::new(Id::Distinct(distinct_id), vec![]))
+            }
 
             Command::Take(id, count) => Ok(Output::new(*id, self.take(&self.plan(*id), *count)?)),
         }
+    }
+
+    fn next_distinct_id(&mut self) -> DistinctId {
+        self.last_id += 1;
+        DistinctId(self.last_id)
     }
 
     fn next_file_id(&mut self) -> FileId {
@@ -277,14 +327,14 @@ impl Engine {
         FileId(self.last_id)
     }
 
-    fn next_tag_id(&mut self) -> TagId {
-        self.last_id += 1;
-        TagId(self.last_id)
-    }
-
     fn next_filter_id(&mut self) -> FilterId {
         self.last_id += 1;
         FilterId(self.last_id)
+    }
+
+    fn next_tag_id(&mut self) -> TagId {
+        self.last_id += 1;
+        TagId(self.last_id)
     }
 
     fn plan(&self, id: Id) -> Plan {
@@ -294,13 +344,18 @@ impl Engine {
     fn plan_steps(&self, id: Id) -> Vec<Id> {
         match id {
             Id::File(_) => vec![id],
-            Id::Tag(tag_id) => {
-                let mut parent = self.plan_steps(Id::File(self.tag_to_file[&tag_id]));
+            Id::Distinct(distinct_id) => {
+                let mut parent = self.plan_steps(self.distinct_to_parent[&distinct_id]);
                 parent.push(id);
                 parent
             }
             Id::Filter(filter_id) => {
                 let mut parent = self.plan_steps(self.filter_to_parent[&filter_id]);
+                parent.push(id);
+                parent
+            }
+            Id::Tag(tag_id) => {
+                let mut parent = self.plan_steps(Id::File(self.tag_to_file[&tag_id]));
                 parent.push(id);
                 parent
             }
@@ -320,20 +375,32 @@ impl Engine {
                         }
                         interval.1 += read_count;
                     }
-                    Id::Tag(tag_id) => {
-                        self.ensure_tag(self.tag_to_file[tag_id], *tag_id, interval)?;
+                    Id::Distinct(distinct_id) => {
+                        self.ensure_distinct(
+                            self.find_parent_tag(Id::Distinct(*distinct_id)).unwrap(),
+                            *distinct_id,
+                            interval,
+                        )?;
                     }
                     Id::Filter(filter_id) => {
                         self.ensure_filter(
-                            self.filter_to_tag(*filter_id).unwrap(),
+                            self.find_parent_tag(Id::Filter(*filter_id)).unwrap(),
                             *filter_id,
                             interval,
                         )?;
+                    }
+                    Id::Tag(tag_id) => {
+                        self.ensure_tag(self.tag_to_file[tag_id], *tag_id, interval)?;
                     }
                 }
             }
 
             match plan.steps.last().unwrap() {
+                Id::Distinct(distinct_id) => {
+                    if self.distinct_caches[distinct_id].count() >= count {
+                        break;
+                    }
+                }
                 Id::File(file_id) => {
                     if self.file_caches[file_id].bounds().len() >= count {
                         break;
@@ -358,11 +425,18 @@ impl Engine {
         let lines = self.read_lines(file_id, interval);
         let tags = self.read_all_tags(file_id, interval);
 
+        // FIXME: Combine distinct filters
         let mut combined_filter: Option<BitSet> = None;
         for filter_id in plan.filter_ids() {
             match combined_filter {
                 Some(ref mut filter) => filter.intersect_with(self.read_filter(filter_id)),
                 None => combined_filter = Some(self.read_filter(filter_id).clone()),
+            }
+        }
+        for distinct_id in plan.distinct_ids() {
+            match combined_filter {
+                Some(ref mut filter) => filter.intersect_with(self.read_distinct(distinct_id)),
+                None => combined_filter = Some(self.read_distinct(distinct_id).clone()),
             }
         }
 
@@ -526,11 +600,11 @@ impl Engine {
         filter_id: FilterId,
         interval: Interval,
     ) -> Result<()> {
-        let cache = self
+        let cache_bounds = self
             .filter_caches
             .entry(filter_id)
-            .or_insert_with(FilterCache::default);
-        let cache_bounds = cache.bounds();
+            .or_insert_with(FilterCache::default)
+            .bounds();
 
         if cache_bounds.contains(interval) {
             return Ok(());
@@ -589,6 +663,76 @@ impl Engine {
         &self.filter_caches[&filter_id].loaded
     }
 
+    fn ensure_distinct(
+        &mut self,
+        tag_id: TagId,
+        distinct_id: DistinctId,
+        interval: Interval,
+    ) -> Result<()> {
+        let cache_bounds = self
+            .distinct_caches
+            .get(&distinct_id)
+            .map(|cache| cache.bounds())
+            .unwrap_or_else(|| Interval(0, 0));
+
+        if cache_bounds.contains(interval) {
+            return Ok(());
+        }
+
+        let mut bloom = self
+            .distinct_caches
+            .get(&distinct_id)
+            .map(|cache| cache.bloom)
+            .unwrap_or_else(Bloom::zero);
+
+        let mut prefix = None;
+        let mut suffix = None;
+
+        let missing_before = cache_bounds.missing_before(interval);
+        if !missing_before.is_empty() {
+            let tag_values = self.read_tag(tag_id, missing_before);
+            prefix = Some(Engine::distinct_values(
+                &mut bloom,
+                tag_values,
+                missing_before.0,
+            ));
+        }
+
+        let missing_after = cache_bounds.missing_after(interval);
+        if !missing_after.is_empty() {
+            let tag_values = self.read_tag(tag_id, missing_after);
+            suffix = Some(Engine::distinct_values(
+                &mut bloom,
+                tag_values,
+                missing_after.0,
+            ));
+        }
+
+        let cache = self
+            .distinct_caches
+            .entry(distinct_id)
+            .or_insert_with(DistinctCache::default);
+
+        if let Some(mut prefix) = prefix {
+            prefix.union_with(&cache.loaded);
+            cache.loaded = prefix;
+            cache.start = interval.0;
+        }
+
+        if let Some(suffix) = suffix {
+            cache.loaded.union_with(&suffix);
+            cache.end = interval.1;
+        }
+
+        cache.bloom = bloom;
+
+        Ok(())
+    }
+
+    fn read_distinct(&self, distinct_id: DistinctId) -> &BitSet {
+        &self.distinct_caches[&distinct_id].loaded
+    }
+
     fn parse_tag_from_lines(lua: &rlua::Lua, tag: &Tag, lines: &[String]) -> Vec<TagValue> {
         let transform = tag.transform.as_ref().map(|s| s.as_str());
         lines
@@ -596,9 +740,9 @@ impl Engine {
             .map(|line| {
                 if let Some(ref regex) = tag.regex {
                     regex.captures(line).and_then(|captures| {
-                        captures.get(1).and_then(|m| {
-                            Engine::transform_chunk(&lua, transform, m.as_str()).ok()
-                        })
+                        captures
+                            .get(1)
+                            .and_then(|m| Engine::transform_chunk(&lua, transform, m.as_str()).ok())
                     })
                 } else {
                     Engine::transform_chunk(&lua, transform, line).ok()
@@ -646,6 +790,20 @@ impl Engine {
         }
     }
 
+    fn distinct_values(bloom: &mut Bloom, tag_values: &[Option<String>], start: usize) -> BitSet {
+        let mut result = BitSet::new();
+        for (idx, value_option) in tag_values.iter().enumerate() {
+            if let Some(value) = value_option {
+                let bytes = value.as_bytes();
+                if !bloom.contains_input(ethbloom::Input::Raw(bytes)) {
+                    result.insert(start + idx);
+                    bloom.accrue(ethbloom::Input::Raw(bytes));
+                }
+            }
+        }
+        result
+    }
+
     fn transform_chunk(lua: &rlua::Lua, transform: Option<&str>, chunk: &str) -> Result<String> {
         match transform {
             Some(eval_src) => Ok(lua.context(|lua_ctx| {
@@ -664,11 +822,12 @@ impl Engine {
             .collect()
     }
 
-    fn filter_to_tag(&self, filter_id: FilterId) -> Option<TagId> {
-        match self.filter_to_parent[&filter_id] {
-            Id::File(_) => None,
-            Id::Filter(fid) => self.filter_to_tag(fid),
+    fn find_parent_tag(&self, id: Id) -> Option<TagId> {
+        match id {
+            Id::Distinct(did) => self.find_parent_tag(self.distinct_to_parent[&did]),
+            Id::Filter(fid) => self.find_parent_tag(self.filter_to_parent[&fid]),
             Id::Tag(tid) => Some(tid),
+            _ => None,
         }
     }
 }
