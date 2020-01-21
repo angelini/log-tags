@@ -1,3 +1,5 @@
+use std::fmt;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct DistinctId(pub usize);
 
@@ -60,6 +62,38 @@ impl Interval {
         } else {
             Interval(self.1, self.1)
         }
+    }
+
+    pub fn iter(&self) -> IntervalIter {
+        IntervalIter {
+            index: self.0,
+            interval: *self,
+        }
+    }
+}
+
+pub struct IntervalIter {
+    index: usize,
+    interval: Interval,
+}
+
+impl Iterator for IntervalIter {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.interval.1 {
+            return None
+        }
+
+        let result = self.index;
+        self.index += 1;
+        Some(result)
+    }
+}
+
+impl fmt::Display for Interval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}, {})", self.0, self.1)
     }
 }
 

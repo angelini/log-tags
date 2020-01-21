@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::io::prelude::*;
@@ -26,6 +27,45 @@ pub enum Command {
     Distinct(Id),
 
     Take(Id, usize),
+}
+
+struct File {
+    index: usize,
+    reader: io::BufReader<fs::File>,
+}
+
+impl File {
+    fn new(path: path::PathBuf) -> Result<File> {
+        let file = fs::File::open(&path)?;
+        Ok(File {
+            index: 0,
+            reader: io::BufReader::new(file),
+        })
+    }
+
+    fn read(&mut self, interval: Interval) -> Result<Vec<String>> {
+        let offset = interval.0 as i64 - self.index as i64;
+
+        if offset != 0 {
+            // FIXME: use seek_relative when it's in stable
+            self.reader.seek(io::SeekFrom::Current(offset))?;
+        }
+
+        let mut result = Vec::with_capacity(interval.len());
+        for idx in interval.iter() {
+            self.index = idx;
+
+            let mut buffer = String::new();
+            let bytes_read = self.reader.read_line(&mut buffer)?;
+            if bytes_read == 0 {
+                break
+            }
+
+            result.push(buffer);
+        }
+
+        Ok(result)
+    }
 }
 
 struct Tag {
@@ -123,9 +163,91 @@ impl Bounded for DistinctCache {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct Stats {
+    distincts: HashMap<DistinctId, Vec<Interval>>,
+    files: HashMap<FileId, Vec<Interval>>,
+    filters: HashMap<FilterId, Vec<Interval>>,
+    tags: HashMap<TagId, Vec<Interval>>,
+}
+
+impl Stats {
+    fn add(&mut self, id: Id, interval: Interval) {
+        match id {
+            Id::Distinct(did) => self
+                .distincts
+                .entry(did)
+                .or_insert_with(Vec::new)
+                .push(interval),
+            Id::File(fid) => self
+                .files
+                .entry(fid)
+                .or_insert_with(Vec::new)
+                .push(interval),
+            Id::Filter(fid) => self
+                .filters
+                .entry(fid)
+                .or_insert_with(Vec::new)
+                .push(interval),
+            Id::Tag(tid) => self.tags.entry(tid).or_insert_with(Vec::new).push(interval),
+        }
+    }
+}
+
+impl fmt::Display for Stats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn write_intervals(f: &mut fmt::Formatter<'_>, intervals: &[Interval]) -> fmt::Result {
+            write!(f, "[")?;
+            for interval in intervals {
+                write!(f, "{}, ", interval)?;
+            }
+            writeln!(f, "]")
+        }
+
+        if !self.files.is_empty() {
+            writeln!(f, "files: {{")?;
+            for (fid, intervals) in &self.files {
+                write!(f, "    {:?}: ", fid)?;
+                write_intervals(f, intervals)?;
+            }
+            writeln!(f, "  }}")?;
+        }
+
+        if !self.filters.is_empty() {
+            writeln!(f, "  tags: {{")?;
+            for (tid, intervals) in &self.tags {
+                write!(f, "    {:?}: ", tid)?;
+                write_intervals(f, intervals)?;
+            }
+            writeln!(f, "  }}")?;
+        }
+
+        if !self.filters.is_empty() {
+            writeln!(f, "  filters: {{")?;
+            for (fid, intervals) in &self.filters {
+                write!(f, "    {:?}: ", fid)?;
+                write_intervals(f, intervals)?;
+            }
+            writeln!(f, "  }}")?;
+        }
+
+        if !self.distincts.is_empty() {
+            writeln!(f, "  distincts: {{")?;
+            for (did, intervals) in &self.distincts {
+                write!(f, "    {:?}: ", did)?;
+                write_intervals(f, intervals)?;
+            }
+            writeln!(f, "  }}")?;
+        }
+
+        Ok(())
+    }
+}
+
 pub struct Output {
     pub id: Option<Id>,
     pub lines: Vec<String>,
+    pub stats: Option<Stats>,
 }
 
 impl Output {
@@ -133,11 +255,16 @@ impl Output {
         Output {
             id: Some(id),
             lines,
+            stats: None,
         }
     }
 
     fn without_id(lines: Vec<String>) -> Output {
-        Output { id: None, lines }
+        Output {
+            id: None,
+            lines,
+            stats: None,
+        }
     }
 }
 
@@ -160,7 +287,7 @@ impl ReadIntervals {
 impl Iterator for ReadIntervals {
     type Item = Interval;
 
-    fn next(&mut self) -> Option<Interval> {
+    fn next(&mut self) -> Option<Self::Item> {
         let interval = Interval(self.index, self.index + self.next);
         self.index += self.next;
         self.next = std::cmp::min(self.max, self.next * 2);
@@ -212,7 +339,7 @@ pub struct Engine {
     last_id: usize,
     lua: rlua::Lua,
 
-    files: HashMap<FileId, fs::File>,
+    files: HashMap<FileId, File>,
     file_caches: HashMap<FileId, FileCache>,
 
     tags: HashMap<TagId, Tag>,
@@ -253,7 +380,7 @@ impl Engine {
         match command {
             Command::Load(path) => {
                 let id = self.next_file_id();
-                self.files.insert(id, fs::File::open(path)?);
+                self.files.insert(id, File::new(path.clone())?);
                 Ok(Output::new(
                     Id::File(id),
                     vec![format!("loaded {:?}", path)],
@@ -284,7 +411,6 @@ impl Engine {
                     .get_mut(tag_id)
                     .ok_or_else(|| Error::MissingId(Id::Tag(*tag_id)))?;
                 tag.with_transform(transform.clone());
-
                 Ok(Output::new(Id::Tag(*tag_id), vec![]))
             }
 
@@ -364,12 +490,13 @@ impl Engine {
 
     fn take(&mut self, plan: &Plan, count: usize) -> Result<Vec<String>> {
         let mut interval = Interval(0, 0);
+        let mut stats = Stats::default();
 
         'outer: for batch_interval in ReadIntervals::new(count, MAX_BATCH_SIZE) {
             for id in &plan.steps {
                 match id {
                     Id::File(file_id) => {
-                        let read_count = self.ensure_file(*file_id, batch_interval)?;
+                        let read_count = self.ensure_file(&mut stats, *file_id, batch_interval)?;
                         if read_count == 0 {
                             break 'outer;
                         }
@@ -377,6 +504,7 @@ impl Engine {
                     }
                     Id::Distinct(distinct_id) => {
                         self.ensure_distinct(
+                            &mut stats,
                             self.find_parent_tag(Id::Distinct(*distinct_id)).unwrap(),
                             *distinct_id,
                             interval,
@@ -384,13 +512,14 @@ impl Engine {
                     }
                     Id::Filter(filter_id) => {
                         self.ensure_filter(
+                            &mut stats,
                             self.find_parent_tag(Id::Filter(*filter_id)).unwrap(),
                             *filter_id,
                             interval,
                         )?;
                     }
                     Id::Tag(tag_id) => {
-                        self.ensure_tag(self.tag_to_file[tag_id], *tag_id, interval)?;
+                        self.ensure_tag(&mut stats, self.tag_to_file[tag_id], *tag_id, interval)?;
                     }
                 }
             }
@@ -420,12 +549,11 @@ impl Engine {
         }
 
         let file_id = plan.file_id();
-        self.ensure_all_tags(plan.file_id(), interval)?;
+        self.ensure_all_tags(&mut stats, plan.file_id(), interval)?;
 
         let lines = self.read_lines(file_id, interval);
         let tags = self.read_all_tags(file_id, interval);
 
-        // FIXME: Combine distinct filters
         let mut combined_filter: Option<BitSet> = None;
         for filter_id in plan.filter_ids() {
             match combined_filter {
@@ -463,6 +591,9 @@ impl Engine {
                 break;
             }
         }
+
+        output.append(&mut vec!["".to_string(), format!("{}", stats)]);
+
         Ok(output)
     }
 
@@ -473,7 +604,12 @@ impl Engine {
         })
     }
 
-    fn ensure_file(&mut self, file_id: FileId, interval: Interval) -> Result<usize> {
+    fn ensure_file(
+        &mut self,
+        stats: &mut Stats,
+        file_id: FileId,
+        interval: Interval,
+    ) -> Result<usize> {
         let cache = self
             .file_caches
             .entry(file_id)
@@ -484,14 +620,12 @@ impl Engine {
             return Ok(std::cmp::min(cache_bounds.1 - interval.0, interval.len()));
         }
 
-        if let Some(file) = self.files.get(&file_id) {
+        if let Some(file) = self.files.get_mut(&file_id) {
             let missing_before = cache_bounds.missing_before(interval);
             if !missing_before.is_empty() {
-                let mut lines = io::BufReader::new(file)
-                    .lines()
-                    .skip(missing_before.0)
-                    .take(missing_before.1)
-                    .collect::<io::Result<Vec<String>>>()?;
+                stats.add(Id::File(file_id), missing_before);
+
+                let mut lines = file.read(missing_before)?;
                 lines.extend(cache.loaded.iter().cloned());
                 cache.loaded = lines;
                 cache.start = missing_before.0;
@@ -499,11 +633,9 @@ impl Engine {
 
             let missing_after = cache_bounds.missing_after(interval);
             if !missing_after.is_empty() {
-                let lines = io::BufReader::new(file)
-                    .lines()
-                    .skip(missing_after.0)
-                    .take(missing_after.1)
-                    .collect::<io::Result<Vec<String>>>()?;
+                stats.add(Id::File(file_id), missing_after);
+
+                let lines = file.read(missing_after)?;
                 cache.loaded.extend(lines.into_iter());
             }
 
@@ -520,7 +652,13 @@ impl Engine {
         &self.file_caches[&file_id].loaded[interval.0..interval.1]
     }
 
-    fn ensure_tag(&mut self, file_id: FileId, tag_id: TagId, interval: Interval) -> Result<()> {
+    fn ensure_tag(
+        &mut self,
+        stats: &mut Stats,
+        file_id: FileId,
+        tag_id: TagId,
+        interval: Interval,
+    ) -> Result<()> {
         let cache_bounds = self
             .tag_caches
             .get(&tag_id)
@@ -541,12 +679,14 @@ impl Engine {
 
         let missing_before = cache_bounds.missing_before(interval);
         if !missing_before.is_empty() {
+            stats.add(Id::Tag(tag_id), missing_before);
             let lines = self.read_lines(file_id, missing_before);
             prefix = Some(Engine::parse_tag_from_lines(&self.lua, tag, lines));
         }
 
         let missing_after = cache_bounds.missing_after(interval);
         if !missing_after.is_empty() {
+            stats.add(Id::Tag(tag_id), missing_after);
             let lines = self.read_lines(file_id, missing_after);
             suffix = Some(Engine::parse_tag_from_lines(&self.lua, tag, lines));
         }
@@ -569,9 +709,14 @@ impl Engine {
         Ok(())
     }
 
-    fn ensure_all_tags(&mut self, file_id: FileId, interval: Interval) -> Result<()> {
+    fn ensure_all_tags(
+        &mut self,
+        stats: &mut Stats,
+        file_id: FileId,
+        interval: Interval,
+    ) -> Result<()> {
         for tag_id in self.file_to_tags(file_id) {
-            self.ensure_tag(file_id, tag_id, interval)?;
+            self.ensure_tag(stats, file_id, tag_id, interval)?;
         }
         Ok(())
     }
@@ -596,6 +741,7 @@ impl Engine {
 
     fn ensure_filter(
         &mut self,
+        stats: &mut Stats,
         tag_id: TagId,
         filter_id: FilterId,
         interval: Interval,
@@ -620,6 +766,7 @@ impl Engine {
 
         let missing_before = cache_bounds.missing_before(interval);
         if !missing_before.is_empty() {
+            stats.add(Id::Filter(filter_id), missing_before);
             let tag_values = self.read_tag(tag_id, missing_before);
             prefix = Some(Engine::filter_values(
                 &self.lua,
@@ -631,6 +778,7 @@ impl Engine {
 
         let missing_after = cache_bounds.missing_after(interval);
         if !missing_after.is_empty() {
+            stats.add(Id::Filter(filter_id), missing_after);
             let tag_values = self.read_tag(tag_id, missing_after);
             suffix = Some(Engine::filter_values(
                 &self.lua,
@@ -665,6 +813,7 @@ impl Engine {
 
     fn ensure_distinct(
         &mut self,
+        stats: &mut Stats,
         tag_id: TagId,
         distinct_id: DistinctId,
         interval: Interval,
@@ -690,6 +839,7 @@ impl Engine {
 
         let missing_before = cache_bounds.missing_before(interval);
         if !missing_before.is_empty() {
+            stats.add(Id::Distinct(distinct_id), missing_before);
             let tag_values = self.read_tag(tag_id, missing_before);
             prefix = Some(Engine::distinct_values(
                 &mut bloom,
@@ -700,6 +850,7 @@ impl Engine {
 
         let missing_after = cache_bounds.missing_after(interval);
         if !missing_after.is_empty() {
+            stats.add(Id::Distinct(distinct_id), missing_after);
             let tag_values = self.read_tag(tag_id, missing_after);
             suffix = Some(Engine::distinct_values(
                 &mut bloom,
