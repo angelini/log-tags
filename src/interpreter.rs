@@ -255,6 +255,7 @@ impl Interpreter {
             let output = self.apply(&mut engine, app, target)?;
             target = output.id;
             lines = output.lines;
+            lines.push(format!("\n  {}", output.stats));
         }
         Ok(lines)
     }

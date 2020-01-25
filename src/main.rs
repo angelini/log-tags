@@ -16,19 +16,24 @@ use error::Result;
 use interpreter::{CursorState, Interpreter};
 
 fn main() -> Result<()> {
-    let mut engine = Engine::new();
-    let mut interpreter = Interpreter::new();
-
-    let matches = App::new("Log-Tags")
+    let args = App::new("Log-Tags")
         .arg(
             Arg::with_name("file")
                 .short("f")
                 .help("Parse and run expressions in this file before the interactive REPL")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("debug")
+                .short("d")
+                .help("Track and print execution stats"),
+        )
         .get_matches();
 
-    if let Some(file_name) = matches.value_of("file") {
+    let mut engine = if args.is_present("debug") { Engine::new_debug() } else { Engine::new() };
+    let mut interpreter = Interpreter::new();
+
+    if let Some(file_name) = args.value_of("file") {
         let file = BufReader::new(File::open(file_name)?);
         let mut state = CursorState::Root;
 
@@ -56,9 +61,7 @@ fn main() -> Result<()> {
                         state = CursorState::Root;
                     }
                 }
-                CursorState::MultiLine => {
-                    state = interpreter.add_line_segment(&segment)?
-                }
+                CursorState::MultiLine => state = interpreter.add_line_segment(&segment)?,
             }
         }
 

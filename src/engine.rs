@@ -58,7 +58,7 @@ impl File {
             let mut buffer = String::new();
             let bytes_read = self.reader.read_line(&mut buffer)?;
             if bytes_read == 0 {
-                break
+                break;
             }
 
             result.push(buffer);
@@ -164,14 +164,14 @@ impl Bounded for DistinctCache {
 }
 
 #[derive(Debug, Default)]
-pub struct Stats {
+pub struct IntervalStats {
     distincts: HashMap<DistinctId, Vec<Interval>>,
     files: HashMap<FileId, Vec<Interval>>,
     filters: HashMap<FilterId, Vec<Interval>>,
     tags: HashMap<TagId, Vec<Interval>>,
 }
 
-impl Stats {
+impl IntervalStats {
     fn add(&mut self, id: Id, interval: Interval) {
         match id {
             Id::Distinct(did) => self
@@ -194,7 +194,7 @@ impl Stats {
     }
 }
 
-impl fmt::Display for Stats {
+impl fmt::Display for IntervalStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fn write_intervals(f: &mut fmt::Formatter<'_>, intervals: &[Interval]) -> fmt::Result {
             write!(f, "[")?;
@@ -244,26 +244,58 @@ impl fmt::Display for Stats {
     }
 }
 
-pub struct Output {
-    pub id: Option<Id>,
-    pub lines: Vec<String>,
-    pub stats: Option<Stats>,
+#[derive(Debug)]
+pub struct Stats {
+    intervals: Option<IntervalStats>,
 }
 
-impl Output {
-    fn new(id: Id, lines: Vec<String>) -> Output {
-        Output {
-            id: Some(id),
-            lines,
-            stats: None,
+impl Stats {
+    fn enabled() -> Self {
+        Self {
+            intervals: Some(IntervalStats::default()),
         }
     }
 
-    fn without_id(lines: Vec<String>) -> Output {
+    fn disabled() -> Self {
+        Self { intervals: None }
+    }
+
+    fn add(&mut self, id: Id, interval: Interval) {
+        if let Some(intervals) = &mut self.intervals {
+            intervals.add(id, interval)
+        }
+    }
+}
+
+impl fmt::Display for Stats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(intervals) = &self.intervals {
+            write!(f, "{}", intervals)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct Output {
+    pub id: Option<Id>,
+    pub lines: Vec<String>,
+    pub stats: Stats,
+}
+
+impl Output {
+    fn with_message(id: Option<Id>, message: String) -> Output {
+        Output {
+            id,
+            lines: vec![message],
+            stats: Stats::disabled(),
+        }
+    }
+
+    fn with_results(lines: Vec<String>, stats: Stats) -> Output {
         Output {
             id: None,
             lines,
-            stats: None,
+            stats,
         }
     }
 }
@@ -336,6 +368,7 @@ impl Plan {
 }
 
 pub struct Engine {
+    debug: bool,
     last_id: usize,
     lua: rlua::Lua,
 
@@ -355,8 +388,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new() -> Engine {
+    pub fn new() -> Self {
         Engine {
+            debug: false,
             last_id: 0,
             lua: rlua::Lua::new(),
 
@@ -376,26 +410,35 @@ impl Engine {
         }
     }
 
+    pub fn new_debug() -> Self {
+        let mut engine = Self::new();
+        engine.debug = true;
+        engine
+    }
+
     pub fn run_command(&mut self, command: &Command) -> Result<Output> {
         match command {
             Command::Load(path) => {
                 let id = self.next_file_id();
                 self.files.insert(id, File::new(path.clone())?);
-                Ok(Output::new(
-                    Id::File(id),
-                    vec![format!("loaded {:?}", path)],
+                Ok(Output::with_message(
+                    Some(Id::File(id)),
+                    format!("file loaded: {:?} {:?}", id, path),
                 ))
             }
             Command::Script(script) => {
                 self.run_script(script)?;
-                Ok(Output::without_id(vec!["script loaded".to_string()]))
+                Ok(Output::with_message(None, "script loaded".to_string()))
             }
 
             Command::Tag(file_id, tag_name) => {
                 let tag_id = self.next_tag_id();
                 self.tags.insert(tag_id, Tag::new(tag_name));
                 self.tag_to_file.insert(tag_id, *file_id);
-                Ok(Output::new(Id::Tag(tag_id), vec![]))
+                Ok(Output::with_message(
+                    Some(Id::Tag(tag_id)),
+                    format!("tag loaded: {} {}", tag_id.0, tag_name),
+                ))
             }
             Command::Regex(tag_id, regex) => {
                 let tag = self
@@ -403,7 +446,10 @@ impl Engine {
                     .get_mut(tag_id)
                     .ok_or_else(|| Error::MissingId(Id::Tag(*tag_id)))?;
                 tag.with_regex(regex)?;
-                Ok(Output::new(Id::Tag(*tag_id), vec![]))
+                Ok(Output::with_message(
+                    Some(Id::Tag(*tag_id)),
+                    format!("regex added to: {}", tag_id.0),
+                ))
             }
             Command::Transform(tag_id, transform) => {
                 let tag = self
@@ -411,7 +457,10 @@ impl Engine {
                     .get_mut(tag_id)
                     .ok_or_else(|| Error::MissingId(Id::Tag(*tag_id)))?;
                 tag.with_transform(transform.clone());
-                Ok(Output::new(Id::Tag(*tag_id), vec![]))
+                Ok(Output::with_message(
+                    Some(Id::Tag(*tag_id)),
+                    format!("transform added to: {}", tag_id.0),
+                ))
             }
 
             Command::DirectFilter(id, comparator, value) => {
@@ -421,7 +470,10 @@ impl Engine {
                 self.filters.insert(filter_id, filter);
                 self.filter_to_parent.insert(filter_id, *id);
 
-                Ok(Output::new(Id::Filter(filter_id), vec![]))
+                Ok(Output::with_message(
+                    Some(Id::Filter(filter_id)),
+                    format!("filter loaded: {}", filter_id.0),
+                ))
             }
             Command::ScriptedFilter(id, test) => {
                 let filter_id = self.next_filter_id();
@@ -430,16 +482,22 @@ impl Engine {
                 self.filters.insert(filter_id, filter);
                 self.filter_to_parent.insert(filter_id, *id);
 
-                Ok(Output::new(Id::Filter(filter_id), vec![]))
+                Ok(Output::with_message(
+                    Some(Id::Filter(filter_id)),
+                    format!("filter loaded: {}", filter_id.0),
+                ))
             }
 
             Command::Distinct(id) => {
                 let distinct_id = self.next_distinct_id();
                 self.distinct_to_parent.insert(distinct_id, *id);
-                Ok(Output::new(Id::Distinct(distinct_id), vec![]))
+                Ok(Output::with_message(
+                    Some(Id::Distinct(distinct_id)),
+                    format!("distinct loaded: {}", distinct_id.0),
+                ))
             }
 
-            Command::Take(id, count) => Ok(Output::new(*id, self.take(&self.plan(*id), *count)?)),
+            Command::Take(id, count) => Ok(self.take(&self.plan(*id), *count)?),
         }
     }
 
@@ -488,9 +546,13 @@ impl Engine {
         }
     }
 
-    fn take(&mut self, plan: &Plan, count: usize) -> Result<Vec<String>> {
+    fn take(&mut self, plan: &Plan, count: usize) -> Result<Output> {
         let mut interval = Interval(0, 0);
-        let mut stats = Stats::default();
+        let mut stats = if self.debug {
+            Stats::enabled()
+        } else {
+            Stats::disabled()
+        };
 
         'outer: for batch_interval in ReadIntervals::new(count, MAX_BATCH_SIZE) {
             for id in &plan.steps {
@@ -568,7 +630,7 @@ impl Engine {
             }
         }
 
-        let mut output = vec![];
+        let mut results = vec![];
         let mut current_count = 0;
 
         for (idx, line) in lines.iter().enumerate() {
@@ -577,9 +639,9 @@ impl Engine {
                     continue;
                 }
             }
-            output.push(line.to_string());
+            results.push(line.to_string());
             for (name, tag_values) in &tags {
-                output.push(format!(
+                results.push(format!(
                     "    {: <15} {:?}",
                     format!("[{}]", name),
                     tag_values[idx]
@@ -592,9 +654,7 @@ impl Engine {
             }
         }
 
-        output.append(&mut vec!["".to_string(), format!("{}", stats)]);
-
-        Ok(output)
+        Ok(Output::with_results(results, stats))
     }
 
     fn run_script(&mut self, script: &str) -> Result<()> {
