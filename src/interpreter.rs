@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use nom::error::convert_error;
+use nom;
 
 use crate::base::{Comparator, Id};
 use crate::engine::{Command, Engine, Output};
@@ -187,7 +187,7 @@ fn parse_line(line: &str, is_pipelined: bool) -> Result<ParseState> {
             nom::Err::Error(e) | nom::Err::Failure(e) => {
                 // FIXME: https://github.com/Geal/nom/issues/1027
                 let default = format!("{:#?}", e);
-                let converted = std::panic::catch_unwind(|| convert_error(&line, e));
+                let converted = std::panic::catch_unwind(|| nom::error::convert_error(&line, e));
                 Err(Error::Parser(converted.unwrap_or(default)))
             }
             nom::Err::Incomplete(_) => Ok(ParseState::Incomplete),

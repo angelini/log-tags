@@ -1,4 +1,4 @@
-use rustyline::error::ReadlineError;
+use rustyline;
 
 use crate::engine::Engine;
 use crate::error::Result;
@@ -30,11 +30,11 @@ pub fn start(mut engine: &mut Engine, interpreter: &mut Interpreter) -> Result<(
                     println!();
                 }
             }
-            Err(ReadlineError::Interrupted) => {
+            Err(rustyline::error::ReadlineError::Interrupted) => {
                 println!("CTRL-C");
                 break;
             }
-            Err(ReadlineError::Eof) => {
+            Err(rustyline::error::ReadlineError::Eof) => {
                 println!("CTRL-D");
                 break;
             }

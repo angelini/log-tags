@@ -5,11 +5,13 @@ use std::io;
 use std::io::prelude::*;
 use std::path;
 
-use bit_set::BitSet;
-use ethbloom::{self, Bloom};
-use regex::Regex;
+use bit_set;
+use ethbloom;
+use regex;
 
-use crate::base::{Bounded, Comparator, DistinctId, FileId, FilterId, Id, Interval, TagId};
+use crate::base::{
+    Aggregator, Comparator, DistinctId, FileId, FilterId, Id, Interval, TagId,
+};
 use crate::error::{Error, Result};
 
 #[derive(Debug)]
@@ -25,6 +27,8 @@ pub enum Command {
     ScriptedFilter(Id, String),
 
     Distinct(Id),
+
+    Group(Id, Aggregator),
 
     Take(Id, usize),
 }
@@ -70,7 +74,7 @@ impl File {
 
 struct Tag {
     name: String,
-    regex: Option<Regex>,
+    regex: Option<regex::Regex>,
     transform: Option<String>,
 }
 
@@ -84,7 +88,7 @@ impl Tag {
     }
 
     fn with_regex(&mut self, regex: &str) -> Result<()> {
-        self.regex = Some(Regex::new(regex)?);
+        self.regex = Some(regex::Regex::new(regex)?);
         Ok(())
     }
 
@@ -98,15 +102,29 @@ enum Filter {
     Scripted(String),
 }
 
+trait Cache {
+    fn bounds(&self) -> Interval;
+    fn size(&self) -> usize;
+}
+
 #[derive(Default)]
 struct FileCache {
     start: usize,
     loaded: Vec<String>,
 }
 
-impl Bounded for FileCache {
+impl Cache for FileCache {
     fn bounds(&self) -> Interval {
         Interval(self.start, self.loaded.len())
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(&self.loaded)
+            + self
+                .loaded
+                .iter()
+                .map(|s| std::mem::size_of_val(s) + s.capacity())
+                .sum::<usize>()
     }
 }
 
@@ -118,9 +136,20 @@ struct TagCache {
     loaded: Vec<TagValue>,
 }
 
-impl Bounded for TagCache {
+impl Cache for TagCache {
     fn bounds(&self) -> Interval {
         Interval(self.start, self.loaded.len())
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(&self.loaded)
+            + self
+                .loaded
+                .iter()
+                .map(|s_opt| {
+                    std::mem::size_of_val(s_opt) + s_opt.as_ref().map(|s| s.capacity()).unwrap_or(0)
+                })
+                .sum::<usize>()
     }
 }
 
@@ -128,7 +157,7 @@ impl Bounded for TagCache {
 struct FilterCache {
     start: usize,
     end: usize,
-    loaded: BitSet,
+    loaded: bit_set::BitSet,
 }
 
 impl FilterCache {
@@ -137,9 +166,13 @@ impl FilterCache {
     }
 }
 
-impl Bounded for FilterCache {
+impl Cache for FilterCache {
     fn bounds(&self) -> Interval {
         Interval(self.start, self.end)
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(&self.loaded)
     }
 }
 
@@ -147,8 +180,8 @@ impl Bounded for FilterCache {
 struct DistinctCache {
     start: usize,
     end: usize,
-    loaded: BitSet,
-    bloom: Bloom,
+    loaded: bit_set::BitSet,
+    bloom: ethbloom::Bloom,
 }
 
 impl DistinctCache {
@@ -157,9 +190,13 @@ impl DistinctCache {
     }
 }
 
-impl Bounded for DistinctCache {
+impl Cache for DistinctCache {
     fn bounds(&self) -> Interval {
         Interval(self.start, self.end)
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(&self.loaded) + std::mem::size_of_val(&self.bloom)
     }
 }
 
@@ -204,65 +241,112 @@ impl fmt::Display for IntervalStats {
             writeln!(f, "]")
         }
 
-        if !self.files.is_empty() {
-            writeln!(f, "files: {{")?;
-            for (fid, intervals) in &self.files {
-                write!(f, "    {:?}: ", fid)?;
+        fn write_interval_kind<T: fmt::Debug + std::cmp::Ord>(
+            f: &mut fmt::Formatter<'_>,
+            name: &str,
+            kinds: &HashMap<T, Vec<Interval>>,
+        ) -> fmt::Result {
+            if kinds.is_empty() {
+                return Ok(())
+            }
+            writeln!(f, "{}: {{", name)?;
+
+            let mut kinds_vec: Vec<(&T, &Vec<Interval>)> = kinds.iter().collect();
+            kinds_vec.sort_by_key(|&(id, _)| id);
+
+            for (id, intervals) in kinds_vec {
+                write!(f, "  {:?}: ", id)?;
                 write_intervals(f, intervals)?;
             }
-            writeln!(f, "  }}")?;
+
+            writeln!(f, "}}")
         }
 
-        if !self.filters.is_empty() {
-            writeln!(f, "  tags: {{")?;
-            for (tid, intervals) in &self.tags {
-                write!(f, "    {:?}: ", tid)?;
-                write_intervals(f, intervals)?;
+        write_interval_kind(f, "files", &self.files)?;
+        write_interval_kind(f, "tags", &self.tags)?;
+        write_interval_kind(f, "filters", &self.filters)?;
+        write_interval_kind(f, "distincts", &self.distincts)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SizeStats {
+    distincts: HashMap<DistinctId, usize>,
+    files: HashMap<FileId, usize>,
+    filters: HashMap<FilterId, usize>,
+    tags: HashMap<TagId, usize>,
+}
+
+impl SizeStats {
+    fn add(&mut self, id: Id, size: usize) {
+        match id {
+            Id::Distinct(did) => *self.distincts.entry(did).or_insert(0) = size,
+            Id::File(fid) => *self.files.entry(fid).or_insert(0) = size,
+            Id::Filter(fid) => *self.filters.entry(fid).or_insert(0) = size,
+            Id::Tag(tid) => *self.tags.entry(tid).or_insert(0) = size,
+        }
+    }
+}
+
+impl fmt::Display for SizeStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn write_size_kind<T: fmt::Debug + std::cmp::Ord>(
+            f: &mut fmt::Formatter<'_>,
+            name: &str,
+            kinds: &HashMap<T, usize>,
+        ) -> fmt::Result {
+            if kinds.is_empty() {
+                return Ok(());
             }
-            writeln!(f, "  }}")?;
-        }
+            writeln!(f, "{}: {{", name)?;
 
-        if !self.filters.is_empty() {
-            writeln!(f, "  filters: {{")?;
-            for (fid, intervals) in &self.filters {
-                write!(f, "    {:?}: ", fid)?;
-                write_intervals(f, intervals)?;
+            let mut kinds_vec: Vec<(&T, &usize)> = kinds.iter().collect();
+            kinds_vec.sort_by_key(|&(id, _)| id);
+
+            for (id, size) in kinds_vec {
+                writeln!(f, "  {:?}: {:.3} MB", id, *size as f64 / 1_000_000.0)?;
             }
-            writeln!(f, "  }}")?;
+
+            writeln!(f, "}}")
         }
 
-        if !self.distincts.is_empty() {
-            writeln!(f, "  distincts: {{")?;
-            for (did, intervals) in &self.distincts {
-                write!(f, "    {:?}: ", did)?;
-                write_intervals(f, intervals)?;
-            }
-            writeln!(f, "  }}")?;
-        }
-
-        Ok(())
+        write_size_kind(f, "files", &self.files)?;
+        write_size_kind(f, "tags", &self.tags)?;
+        write_size_kind(f, "filters", &self.filters)?;
+        write_size_kind(f, "distincts", &self.distincts)
     }
 }
 
 #[derive(Debug)]
 pub struct Stats {
     intervals: Option<IntervalStats>,
+    sizes: Option<SizeStats>,
 }
 
 impl Stats {
     fn enabled() -> Self {
         Self {
             intervals: Some(IntervalStats::default()),
+            sizes: Some(SizeStats::default()),
         }
     }
 
     fn disabled() -> Self {
-        Self { intervals: None }
+        Self {
+            intervals: None,
+            sizes: None,
+        }
     }
 
-    fn add(&mut self, id: Id, interval: Interval) {
+    fn add_interval(&mut self, id: Id, interval: Interval) {
         if let Some(intervals) = &mut self.intervals {
-            intervals.add(id, interval)
+            intervals.add(id, interval);
+        }
+    }
+
+    fn add_size(&mut self, id: Id, size: usize) {
+        if let Some(sizes) = &mut self.sizes {
+            sizes.add(id, size);
         }
     }
 }
@@ -270,7 +354,10 @@ impl Stats {
 impl fmt::Display for Stats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(intervals) = &self.intervals {
-            write!(f, "{}", intervals)?;
+            write!(f, "\nintervals\n---------\n{}", intervals)?;
+        }
+        if let Some(sizes) = &self.sizes {
+            write!(f, "\nsizes\n-----\n{}", sizes)?;
         }
         Ok(())
     }
@@ -497,6 +584,8 @@ impl Engine {
                 ))
             }
 
+            Command::Group(id, aggregator) => unimplemented!(),
+
             Command::Take(id, count) => Ok(self.take(&self.plan(*id), *count)?),
         }
     }
@@ -616,7 +705,7 @@ impl Engine {
         let lines = self.read_lines(file_id, interval);
         let tags = self.read_all_tags(file_id, interval);
 
-        let mut combined_filter: Option<BitSet> = None;
+        let mut combined_filter: Option<bit_set::BitSet> = None;
         for filter_id in plan.filter_ids() {
             match combined_filter {
                 Some(ref mut filter) => filter.intersect_with(self.read_filter(filter_id)),
@@ -639,14 +728,16 @@ impl Engine {
                     continue;
                 }
             }
+
             results.push(line.to_string());
             for (name, tag_values) in &tags {
-                results.push(format!(
-                    "    {: <15} {:?}",
-                    format!("[{}]", name),
-                    tag_values[idx]
-                ))
+                if let Some(value) = &tag_values[idx] {
+                    results.push(format!("    {: <15} {:?}", format!("[{}]", name), value,))
+                } else {
+                    results.push(format!("    [{: <15}] N/A", name))
+                }
             }
+            results.push("".to_string());
 
             current_count += 1;
             if current_count >= count {
@@ -677,13 +768,14 @@ impl Engine {
         let cache_bounds = cache.bounds();
 
         if cache_bounds.contains(interval) {
+            stats.add_size(Id::File(file_id), cache.size());
             return Ok(std::cmp::min(cache_bounds.1 - interval.0, interval.len()));
         }
 
         if let Some(file) = self.files.get_mut(&file_id) {
             let missing_before = cache_bounds.missing_before(interval);
             if !missing_before.is_empty() {
-                stats.add(Id::File(file_id), missing_before);
+                stats.add_interval(Id::File(file_id), missing_before);
 
                 let mut lines = file.read(missing_before)?;
                 lines.extend(cache.loaded.iter().cloned());
@@ -693,12 +785,13 @@ impl Engine {
 
             let missing_after = cache_bounds.missing_after(interval);
             if !missing_after.is_empty() {
-                stats.add(Id::File(file_id), missing_after);
+                stats.add_interval(Id::File(file_id), missing_after);
 
                 let lines = file.read(missing_after)?;
                 cache.loaded.extend(lines.into_iter());
             }
 
+            stats.add_size(Id::File(file_id), cache.size());
             Ok(std::cmp::min(
                 cache.bounds().1 - std::cmp::min(cache.bounds().1, interval.0),
                 interval.len(),
@@ -719,13 +812,16 @@ impl Engine {
         tag_id: TagId,
         interval: Interval,
     ) -> Result<()> {
-        let cache_bounds = self
-            .tag_caches
-            .get(&tag_id)
+        let cache_opt = self.tag_caches.get(&tag_id);
+        let cache_bounds = cache_opt
             .map(|cache| cache.bounds())
             .unwrap_or(Interval(0, 0));
 
         if cache_bounds.contains(interval) {
+            stats.add_size(
+                Id::Tag(tag_id),
+                cache_opt.map(|cache| cache.size()).unwrap_or(0),
+            );
             return Ok(());
         }
 
@@ -739,14 +835,14 @@ impl Engine {
 
         let missing_before = cache_bounds.missing_before(interval);
         if !missing_before.is_empty() {
-            stats.add(Id::Tag(tag_id), missing_before);
+            stats.add_interval(Id::Tag(tag_id), missing_before);
             let lines = self.read_lines(file_id, missing_before);
             prefix = Some(Engine::parse_tag_from_lines(&self.lua, tag, lines));
         }
 
         let missing_after = cache_bounds.missing_after(interval);
         if !missing_after.is_empty() {
-            stats.add(Id::Tag(tag_id), missing_after);
+            stats.add_interval(Id::Tag(tag_id), missing_after);
             let lines = self.read_lines(file_id, missing_after);
             suffix = Some(Engine::parse_tag_from_lines(&self.lua, tag, lines));
         }
@@ -766,6 +862,7 @@ impl Engine {
             cache.loaded.extend(suffix.into_iter());
         }
 
+        stats.add_size(Id::Tag(tag_id), cache.size());
         Ok(())
     }
 
@@ -806,13 +903,16 @@ impl Engine {
         filter_id: FilterId,
         interval: Interval,
     ) -> Result<()> {
-        let cache_bounds = self
-            .filter_caches
-            .entry(filter_id)
-            .or_insert_with(FilterCache::default)
-            .bounds();
+        let cache_opt = self.filter_caches.get(&filter_id);
+        let cache_bounds = cache_opt
+            .map(|cache| cache.bounds())
+            .unwrap_or(Interval(0, 0));
 
         if cache_bounds.contains(interval) {
+            stats.add_size(
+                Id::Filter(filter_id),
+                cache_opt.map(|cache| cache.size()).unwrap_or(0),
+            );
             return Ok(());
         }
 
@@ -826,7 +926,7 @@ impl Engine {
 
         let missing_before = cache_bounds.missing_before(interval);
         if !missing_before.is_empty() {
-            stats.add(Id::Filter(filter_id), missing_before);
+            stats.add_interval(Id::Filter(filter_id), missing_before);
             let tag_values = self.read_tag(tag_id, missing_before);
             prefix = Some(Engine::filter_values(
                 &self.lua,
@@ -838,7 +938,7 @@ impl Engine {
 
         let missing_after = cache_bounds.missing_after(interval);
         if !missing_after.is_empty() {
-            stats.add(Id::Filter(filter_id), missing_after);
+            stats.add_interval(Id::Filter(filter_id), missing_after);
             let tag_values = self.read_tag(tag_id, missing_after);
             suffix = Some(Engine::filter_values(
                 &self.lua,
@@ -864,10 +964,11 @@ impl Engine {
             cache.end = interval.1;
         }
 
+        stats.add_size(Id::Filter(filter_id), cache.size());
         Ok(())
     }
 
-    fn read_filter(&self, filter_id: FilterId) -> &BitSet {
+    fn read_filter(&self, filter_id: FilterId) -> &bit_set::BitSet {
         &self.filter_caches[&filter_id].loaded
     }
 
@@ -878,13 +979,16 @@ impl Engine {
         distinct_id: DistinctId,
         interval: Interval,
     ) -> Result<()> {
-        let cache_bounds = self
-            .distinct_caches
-            .get(&distinct_id)
+        let cache_opt = self.distinct_caches.get(&distinct_id);
+        let cache_bounds = cache_opt
             .map(|cache| cache.bounds())
-            .unwrap_or_else(|| Interval(0, 0));
+            .unwrap_or(Interval(0, 0));
 
         if cache_bounds.contains(interval) {
+            stats.add_size(
+                Id::Distinct(distinct_id),
+                cache_opt.map(|cache| cache.size()).unwrap_or(0),
+            );
             return Ok(());
         }
 
@@ -892,14 +996,14 @@ impl Engine {
             .distinct_caches
             .get(&distinct_id)
             .map(|cache| cache.bloom)
-            .unwrap_or_else(Bloom::zero);
+            .unwrap_or_else(ethbloom::Bloom::zero);
 
         let mut prefix = None;
         let mut suffix = None;
 
         let missing_before = cache_bounds.missing_before(interval);
         if !missing_before.is_empty() {
-            stats.add(Id::Distinct(distinct_id), missing_before);
+            stats.add_interval(Id::Distinct(distinct_id), missing_before);
             let tag_values = self.read_tag(tag_id, missing_before);
             prefix = Some(Engine::distinct_values(
                 &mut bloom,
@@ -910,7 +1014,7 @@ impl Engine {
 
         let missing_after = cache_bounds.missing_after(interval);
         if !missing_after.is_empty() {
-            stats.add(Id::Distinct(distinct_id), missing_after);
+            stats.add_interval(Id::Distinct(distinct_id), missing_after);
             let tag_values = self.read_tag(tag_id, missing_after);
             suffix = Some(Engine::distinct_values(
                 &mut bloom,
@@ -937,10 +1041,11 @@ impl Engine {
 
         cache.bloom = bloom;
 
+        stats.add_size(Id::Distinct(distinct_id), cache.size());
         Ok(())
     }
 
-    fn read_distinct(&self, distinct_id: DistinctId) -> &BitSet {
+    fn read_distinct(&self, distinct_id: DistinctId) -> &bit_set::BitSet {
         &self.distinct_caches[&distinct_id].loaded
     }
 
@@ -967,10 +1072,10 @@ impl Engine {
         filter: &Filter,
         values: &[TagValue],
         start: usize,
-    ) -> Result<BitSet> {
+    ) -> Result<bit_set::BitSet> {
         match filter {
             Filter::Direct(comp, right) => {
-                let mut result = BitSet::new();
+                let mut result = bit_set::BitSet::new();
                 for (idx, left_option) in values.iter().enumerate() {
                     match (comp, left_option) {
                         (Comparator::Equal, Some(left)) if left == right => {
@@ -998,7 +1103,7 @@ impl Engine {
                 Ok(result)
             }
             Filter::Scripted(script) => {
-                let mut result = BitSet::new();
+                let mut result = bit_set::BitSet::new();
                 for (idx, value_option) in values.iter().enumerate() {
                     if let Some(value) = value_option {
                         if Self::test_chunk(lua, script, value)? {
@@ -1011,8 +1116,12 @@ impl Engine {
         }
     }
 
-    fn distinct_values(bloom: &mut Bloom, tag_values: &[Option<String>], start: usize) -> BitSet {
-        let mut result = BitSet::new();
+    fn distinct_values(
+        bloom: &mut ethbloom::Bloom,
+        tag_values: &[Option<String>],
+        start: usize,
+    ) -> bit_set::BitSet {
+        let mut result = bit_set::BitSet::new();
         for (idx, value_option) in tag_values.iter().enumerate() {
             if let Some(value) = value_option {
                 let bytes = value.as_bytes();
