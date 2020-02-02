@@ -10,7 +10,7 @@ use ethbloom;
 use regex;
 
 use crate::base::{
-    Aggregator, Comparator, DistinctId, FileId, FilterId, Id, Interval, TagId,
+    Aggregator, Comparator, DistinctId, FileId, FilterId, GroupId, Id, Interval, TagId,
 };
 use crate::error::{Error, Result};
 
@@ -28,7 +28,8 @@ pub enum Command {
 
     Distinct(Id),
 
-    Group(Id, Aggregator),
+    Group(Id),
+    Aggregate(GroupId, TagId, Aggregator),
 
     Take(Id, usize),
 }
@@ -100,6 +101,22 @@ impl Tag {
 enum Filter {
     Direct(Comparator, String),
     Scripted(String),
+}
+
+struct Group {
+    aggregators: HashMap<TagId, Aggregator>,
+}
+
+impl Group {
+    fn new() -> Group {
+        Group {
+            aggregators: HashMap::new(),
+        }
+    }
+
+    fn with_aggregator(&mut self, tag_id: TagId, aggregator: Aggregator) {
+        self.aggregators.insert(tag_id, aggregator);
+    }
 }
 
 trait Cache {
@@ -176,6 +193,69 @@ impl Cache for FilterCache {
     }
 }
 
+enum AggCache {
+    Max(String),
+    Min(String),
+}
+
+impl AggCache {
+    fn new(agg_type: Aggregator) -> AggCache {
+        match agg_type {
+            Aggregator::Max => AggCache::Max(String::new()),
+            Aggregator::Min => AggCache::Min(String::new()),
+        }
+    }
+
+    fn combine(&mut self, aggregator: AggCache) {
+        match self {
+            AggCache::Max(ref mut current) => {
+                if let AggCache::Max(new_value) = aggregator {
+                    if &new_value > current {
+                        *current = new_value
+                    }
+                }
+            }
+            AggCache::Min(ref mut current) => {
+                if let AggCache::Min(new_value) = aggregator {
+                    if &new_value < current {
+                        *current = new_value
+                    }
+                }
+            }
+        }
+    }
+
+    fn size(&self) -> usize {
+        match self {
+            AggCache::Max(value) => value.capacity(),
+            AggCache::Min(value) => value.capacity(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct GroupCache {
+    start: usize,
+    end: usize,
+    loaded: HashMap<TagId, AggCache>,
+}
+
+impl GroupCache {
+    fn count(&self) -> usize {
+        self.loaded.len()
+    }
+}
+
+impl Cache for GroupCache {
+    fn bounds(&self) -> Interval {
+        Interval(self.start, self.end)
+    }
+
+    fn size(&self) -> usize {
+        self.loaded.iter().map(|(_, cache)| cache.size()).sum()
+    }
+}
+
 #[derive(Default)]
 struct DistinctCache {
     start: usize,
@@ -205,6 +285,7 @@ pub struct IntervalStats {
     distincts: HashMap<DistinctId, Vec<Interval>>,
     files: HashMap<FileId, Vec<Interval>>,
     filters: HashMap<FilterId, Vec<Interval>>,
+    groups: HashMap<GroupId, Vec<Interval>>,
     tags: HashMap<TagId, Vec<Interval>>,
 }
 
@@ -224,6 +305,11 @@ impl IntervalStats {
             Id::Filter(fid) => self
                 .filters
                 .entry(fid)
+                .or_insert_with(Vec::new)
+                .push(interval),
+            Id::Group(gid) => self
+                .groups
+                .entry(gid)
                 .or_insert_with(Vec::new)
                 .push(interval),
             Id::Tag(tid) => self.tags.entry(tid).or_insert_with(Vec::new).push(interval),
@@ -247,7 +333,7 @@ impl fmt::Display for IntervalStats {
             kinds: &HashMap<T, Vec<Interval>>,
         ) -> fmt::Result {
             if kinds.is_empty() {
-                return Ok(())
+                return Ok(());
             }
             writeln!(f, "{}: {{", name)?;
 
@@ -265,6 +351,7 @@ impl fmt::Display for IntervalStats {
         write_interval_kind(f, "files", &self.files)?;
         write_interval_kind(f, "tags", &self.tags)?;
         write_interval_kind(f, "filters", &self.filters)?;
+        write_interval_kind(f, "groups", &self.groups)?;
         write_interval_kind(f, "distincts", &self.distincts)
     }
 }
@@ -274,6 +361,7 @@ pub struct SizeStats {
     distincts: HashMap<DistinctId, usize>,
     files: HashMap<FileId, usize>,
     filters: HashMap<FilterId, usize>,
+    groups: HashMap<GroupId, usize>,
     tags: HashMap<TagId, usize>,
 }
 
@@ -283,6 +371,7 @@ impl SizeStats {
             Id::Distinct(did) => *self.distincts.entry(did).or_insert(0) = size,
             Id::File(fid) => *self.files.entry(fid).or_insert(0) = size,
             Id::Filter(fid) => *self.filters.entry(fid).or_insert(0) = size,
+            Id::Group(gid) => *self.groups.entry(gid).or_insert(0) = size,
             Id::Tag(tid) => *self.tags.entry(tid).or_insert(0) = size,
         }
     }
@@ -313,6 +402,7 @@ impl fmt::Display for SizeStats {
         write_size_kind(f, "files", &self.files)?;
         write_size_kind(f, "tags", &self.tags)?;
         write_size_kind(f, "filters", &self.filters)?;
+        write_size_kind(f, "groups", &self.groups)?;
         write_size_kind(f, "distincts", &self.distincts)
     }
 }
@@ -470,6 +560,10 @@ pub struct Engine {
     filter_caches: HashMap<FilterId, FilterCache>,
     filter_to_parent: HashMap<FilterId, Id>,
 
+    groups: HashMap<GroupId, Group>,
+    group_caches: HashMap<GroupId, GroupCache>,
+    group_to_parent: HashMap<GroupId, Id>,
+
     distinct_caches: HashMap<DistinctId, DistinctCache>,
     distinct_to_parent: HashMap<DistinctId, Id>,
 }
@@ -491,6 +585,10 @@ impl Engine {
             filters: HashMap::new(),
             filter_caches: HashMap::new(),
             filter_to_parent: HashMap::new(),
+
+            groups: HashMap::new(),
+            group_caches: HashMap::new(),
+            group_to_parent: HashMap::new(),
 
             distinct_caches: HashMap::new(),
             distinct_to_parent: HashMap::new(),
@@ -575,6 +673,29 @@ impl Engine {
                 ))
             }
 
+            Command::Group(id) => {
+                let group_id = self.next_group_id();
+
+                self.groups.insert(group_id, Group::new());
+                self.group_to_parent.insert(group_id, *id);
+
+                Ok(Output::with_message(
+                    Some(Id::Group(group_id)),
+                    "group loaded".to_string(),
+                ))
+            }
+            Command::Aggregate(group_id, tag_id, aggregator) => {
+                let group = self
+                    .groups
+                    .get_mut(group_id)
+                    .ok_or_else(|| Error::MissingId(Id::Group(*group_id)))?;
+                group.with_aggregator(*tag_id, *aggregator);
+                Ok(Output::with_message(
+                    Some(Id::Tag(*tag_id)),
+                    format!("aggregator added to: {}", group_id.0),
+                ))
+            }
+
             Command::Distinct(id) => {
                 let distinct_id = self.next_distinct_id();
                 self.distinct_to_parent.insert(distinct_id, *id);
@@ -583,8 +704,6 @@ impl Engine {
                     format!("distinct loaded: {}", distinct_id.0),
                 ))
             }
-
-            Command::Group(id, aggregator) => unimplemented!(),
 
             Command::Take(id, count) => Ok(self.take(&self.plan(*id), *count)?),
         }
@@ -603,6 +722,11 @@ impl Engine {
     fn next_filter_id(&mut self) -> FilterId {
         self.last_id += 1;
         FilterId(self.last_id)
+    }
+
+    fn next_group_id(&mut self) -> GroupId {
+        self.last_id += 1;
+        GroupId(self.last_id)
     }
 
     fn next_tag_id(&mut self) -> TagId {
@@ -624,6 +748,11 @@ impl Engine {
             }
             Id::Filter(filter_id) => {
                 let mut parent = self.plan_steps(self.filter_to_parent[&filter_id]);
+                parent.push(id);
+                parent
+            }
+            Id::Group(group_id) => {
+                let mut parent = self.plan_steps(self.group_to_parent[&group_id]);
                 parent.push(id);
                 parent
             }
@@ -669,6 +798,14 @@ impl Engine {
                             interval,
                         )?;
                     }
+                    Id::Group(group_id) => {
+                        self.ensure_group(
+                            &mut stats,
+                            self.find_parent_tag(Id::Group(*group_id)).unwrap(),
+                            *group_id,
+                            interval,
+                        )?;
+                    }
                     Id::Tag(tag_id) => {
                         self.ensure_tag(&mut stats, self.tag_to_file[tag_id], *tag_id, interval)?;
                     }
@@ -688,6 +825,11 @@ impl Engine {
                 }
                 Id::Filter(filter_id) => {
                     if self.filter_caches[filter_id].count() >= count {
+                        break;
+                    }
+                }
+                Id::Group(group_id) => {
+                    if self.group_caches[group_id].count() >= count {
                         break;
                     }
                 }
@@ -972,6 +1114,83 @@ impl Engine {
         &self.filter_caches[&filter_id].loaded
     }
 
+    fn ensure_group(
+        &mut self,
+        stats: &mut Stats,
+        tag_id: TagId,
+        group_id: GroupId,
+        interval: Interval,
+    ) -> Result<()> {
+        let cache_opt = self.group_caches.get(&group_id);
+        let cache_bounds = cache_opt
+            .map(|cache| cache.bounds())
+            .unwrap_or(Interval(0, 0));
+
+        if cache_bounds.contains(interval) {
+            stats.add_size(
+                Id::Group(group_id),
+                cache_opt.map(|cache| cache.size()).unwrap_or(0),
+            );
+            return Ok(());
+        }
+
+        let group = self
+            .groups
+            .get(&group_id)
+            .ok_or_else(|| Error::MissingId(Id::Group(group_id)))?;
+
+        let mut prefix = None;
+        let mut suffix = None;
+
+        let missing_before = cache_bounds.missing_before(interval);
+        if !missing_before.is_empty() {
+            stats.add_interval(Id::Group(group_id), missing_before);
+            let tag_values = self.read_tag(tag_id, missing_before);
+            prefix = Some(Engine::group_values(group, tag_values));
+        }
+
+        let missing_after = cache_bounds.missing_after(interval);
+        if !missing_after.is_empty() {
+            stats.add_interval(Id::Group(group_id), missing_after);
+            let tag_values = self.read_tag(tag_id, missing_before);
+            suffix = Some(Engine::group_values(group, tag_values));
+        }
+
+        let cache = self
+            .group_caches
+            .entry(group_id)
+            .or_insert_with(GroupCache::default);
+
+        let tag_ids: Vec<TagId> = cache.loaded.keys().cloned().collect();
+
+        if let Some(mut prefix) = prefix {
+            for tag_id in &tag_ids {
+                let agg_type = group.aggregators.get(tag_id).unwrap();
+                let agg = cache
+                    .loaded
+                    .entry(*tag_id)
+                    .or_insert_with(|| AggCache::new(*agg_type));
+                agg.combine(prefix.remove(tag_id).unwrap())
+            }
+            cache.start = interval.0;
+        }
+
+        if let Some(mut suffix) = suffix {
+            for tag_id in &tag_ids {
+                let agg_type = group.aggregators.get(tag_id).unwrap();
+                let agg = cache
+                    .loaded
+                    .entry(*tag_id)
+                    .or_insert_with(|| AggCache::new(*agg_type));
+                agg.combine(suffix.remove(tag_id).unwrap())
+            }
+            cache.end = interval.1;
+        }
+
+        stats.add_size(Id::Tag(tag_id), cache.size());
+        Ok(())
+    }
+
     fn ensure_distinct(
         &mut self,
         stats: &mut Stats,
@@ -1114,6 +1333,10 @@ impl Engine {
                 Ok(result)
             }
         }
+    }
+
+    fn group_values(group: &Group, tag_values: &[Option<String>]) -> HashMap<TagId, AggCache> {
+        unimplemented!()
     }
 
     fn distinct_values(

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use nom;
 
-use crate::base::{Comparator, Id};
+use crate::base::{Aggregator, Comparator, Id};
 use crate::engine::{Command, Engine, Output};
 use crate::error::{Error, Result, SyntaxError};
 use crate::parser::{self, Expression};
@@ -31,6 +31,20 @@ pub enum Application {
     ScriptedFilterNamed(String, String, String),
     ScriptedFilterPiped(String),
     ScriptedFilterPipedNamed(String, String),
+
+    // group('date)
+    Group(String),
+    // group('date, 'grouped-date)
+    GroupNamed(String, String),
+    // tag('example, 'date)
+    // group()
+    GroupPiped,
+    // tag('example, 'date)
+    // group('grouped-date)
+    GroupPipedNamed(String),
+
+    Aggregate(String, String, Aggregator),
+    AggregatePiped(String, Aggregator),
 
     Distinct(String),
     DistinctPiped,
@@ -115,6 +129,32 @@ impl Application {
                     Ok(Application::ScriptedFilterPiped(test.clone()))
                 }
 
+                ("group",
+                 []) => {
+                    Ok(Application::GroupPiped)
+                }
+                ("group",
+                 [Expression::Symbol(parent_or_name)]) => {
+                    if is_pipelined {
+                        Ok(Application::GroupPipedNamed(parent_or_name.clone()))
+                    } else {
+                        Ok(Application::Group(parent_or_name.clone()))
+                    }
+                }
+                ("group",
+                 [Expression::Symbol(parent), Expression::Symbol(name)]) => {
+                    Ok(Application::GroupNamed(parent.clone(), name.clone()))
+                }
+
+                ("agg",
+                 [Expression::Symbol(group), Expression::Symbol(tag), Expression::Aggregator(aggregator)]) => {
+                    Ok(Application::Aggregate(group.clone(), tag.clone(), *aggregator))
+                }
+                ("agg",
+                 [Expression::Symbol(tag), Expression::Aggregator(aggregator)]) => {
+                    Ok(Application::AggregatePiped(tag.clone(), *aggregator))
+                }
+
                 ("distinct",
                  [Expression::Symbol(parent)]) => {
                     Ok(Application::Distinct(parent.clone()))
@@ -149,6 +189,9 @@ impl Application {
             Application::DirectFilterNamed(_, _, _, _) => false,
             Application::ScriptedFilter(_, _) => false,
             Application::ScriptedFilterNamed(_, _, _) => false,
+            Application::Group(_) => false,
+            Application::GroupNamed(_, _) => false,
+            Application::Aggregate(_, _, _) => false,
             Application::Distinct(_) => false,
             Application::Take(_, _) => false,
 
@@ -159,6 +202,9 @@ impl Application {
             Application::DirectFilterPipedNamed(_, _, _) => true,
             Application::ScriptedFilterPiped(_) => true,
             Application::ScriptedFilterPipedNamed(_, _) => true,
+            Application::GroupPiped => true,
+            Application::GroupPipedNamed(_) => true,
+            Application::AggregatePiped(_, _) => true,
             Application::DistinctPiped => true,
             Application::TakePiped(_) => true,
         }
@@ -389,6 +435,58 @@ impl Interpreter {
                     Ok(output)
                 } else {
                     Err(Error::InvalidTarget(format!("{:?}", target)))
+                }
+            }
+
+            Application::Group(parent_name) => {
+                if let Some(id) = self.symbols.get(&parent_name) {
+                    engine.run_command(&Command::Group(*id))
+                } else {
+                    Err(Error::SymbolNotFound(parent_name))
+                }
+            }
+            Application::GroupNamed(parent_name, group_name) => {
+                if let Some(id) = self.symbols.get(&parent_name) {
+                    let output =
+                        engine.run_command(&Command::Group(*id))?;
+                    self.add_symbol(group_name, output.id)?;
+                    Ok(output)
+                } else {
+                    Err(Error::SymbolNotFound(parent_name))
+                }
+            }
+            Application::GroupPiped => {
+                if let Some(id) = target {
+                    engine.run_command(&Command::Group(id))
+                } else {
+                    Err(Error::InvalidTarget(format!("{:?}", target)))
+                }
+            }
+            Application::GroupPipedNamed(group_name) => {
+                if let Some(id) = target {
+                    let output =
+                        engine.run_command(&Command::Group(id))?;
+                    self.add_symbol(group_name, output.id)?;
+                    Ok(output)
+                } else {
+                    Err(Error::InvalidTarget(format!("{:?}", target)))
+                }
+            }
+
+            Application::Aggregate(group_name, tag_name, aggregator) => {
+                match (self.symbols.get(&group_name), self.symbols.get(&tag_name)) {
+                    (Some(Id::Group(group_id)), Some(Id::Tag(tag_id))) => {
+                        engine.run_command(&Command::Aggregate(*group_id, *tag_id, aggregator))
+                    }
+                    _ => unreachable!()
+                }
+            }
+            Application::AggregatePiped(tag_name, aggregator) => {
+                match (target, self.symbols.get(&tag_name)) {
+                    (Some(Id::Group(group_id)), Some(Id::Tag(tag_id))) => {
+                        engine.run_command(&Command::Aggregate(group_id, *tag_id, aggregator))
+                    }
+                    _ => unreachable!()
                 }
             }
 

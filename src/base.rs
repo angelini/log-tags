@@ -10,6 +10,9 @@ pub struct FileId(pub usize);
 pub struct FilterId(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GroupId(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TagId(pub usize);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -17,6 +20,7 @@ pub enum Id {
     Distinct(DistinctId),
     File(FileId),
     Filter(FilterId),
+    Group(GroupId),
     Tag(TagId),
 }
 
@@ -32,7 +36,8 @@ pub enum Comparator {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Aggregator {
-
+    Max,
+    Min,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

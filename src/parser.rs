@@ -10,12 +10,13 @@ use nom::{
     IResult,
 };
 
-use crate::base::Comparator;
+use crate::base::{Aggregator, Comparator};
 
 type Err<'a> = VerboseError<&'a str>;
 
 #[derive(Clone, Debug)]
 pub enum Expression {
+    Aggregator(Aggregator),
     Application(String, Vec<Expression>),
     Comparator(Comparator),
     Int(usize),
@@ -40,6 +41,20 @@ fn parse_comparator<'a>(i: &'a str) -> IResult<&'a str, Comparator, Err<'a>> {
             ">=" => Comparator::GreaterThanEqual,
             "<" => Comparator::LessThan,
             "<=" => Comparator::LessThanEqual,
+            _ => unreachable!(),
+        },
+    )(i)
+}
+
+fn parse_aggregator<'a>(i: &'a str) -> IResult<&'a str, Aggregator, Err<'a>> {
+    map(
+        alt((
+            tag("max"),
+            tag("min"),
+        )),
+        |comp_str: &str| match comp_str {
+            "max" => Aggregator::Max,
+            "min" => Aggregator::Min,
             _ => unreachable!(),
         },
     )(i)
@@ -86,6 +101,7 @@ pub fn parse_expression<'a>(i: &'a str) -> IResult<&'a str, Expression, Err<'a>>
         map(parse_application, |(func, args)| {
             Expression::Application(func.to_string(), args)
         }),
+        map(parse_aggregator, Expression::Aggregator),
         map(parse_comparator, Expression::Comparator),
         map(parse_int, Expression::Int),
         map(parse_double_quoted_str, Expression::String),

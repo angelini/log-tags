@@ -1,0 +1,16 @@
+> load('log, "apache.log")
+
+> script("
+months = {}
+months['Dec'] = 12
+
+function parse_date (d)
+  return string.sub(d, 9, 10) .. '-' .. months[string.sub(d, 5, 7)] .. '-' .. string.sub(d, 21, 24)
+end
+")
+
+> tag('log, 'date)
+| regex("\[(\S+ \S+ \d+ \d+:\d+:\d+ \d+)\]")
+| transform("parse_date(chunk)")
+| distinct()
+| take(5)
